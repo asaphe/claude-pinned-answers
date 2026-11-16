@@ -1,6 +1,6 @@
 # pinned-answers
 
-Answers to your questions get lost in long replies and scrollback. This Claude Code plugin keeps the full answer on screen in a pane beside the chat until you say you've seen it.
+Answers to your questions get lost in long replies and scrollback. This Claude Code plugin keeps the answer on screen in a pane beside the chat until you say you've seen it.
 
 ## How it works
 
