@@ -1,0 +1,9 @@
+{
+  "name": "pinned-answers",
+  "version": "0.1.0",
+  "description": "Keeps the full answer to each question in a pane beside the chat until you type ack",
+  "author": { "name": "asaphe" },
+  "license": "Apache-2.0",
+  "repository": "https://github.com/asaphe/claude-pinned-answers",
+  "types": "./types/index.d.ts"
+}

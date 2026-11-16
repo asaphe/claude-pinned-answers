@@ -1,0 +1,12 @@
+{
+  "name": "claude-pinned-answers",
+  "description": "Keeps the answer to your question on screen until you say you've seen it.",
+  "owner": { "name": "asaphe" },
+  "plugins": [
+    {
+      "name": "pinned-answers",
+      "source": "./",
+      "description": "Pins the full answer to each question in a pane beside the chat until you type ack."
+    }
+  ]
+}
