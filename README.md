@@ -5,14 +5,15 @@ Answers to your questions get lost in long replies and scrollback. This Claude C
 ## How it works
 
 1. You ask something: the prompt contains `?`, or starts with why, what, how, is, can, did, should, and so on.
-2. Claude replies with a line starting `**Answer:**`. The plugin pins that paragraph (up to the first blank line, at most 3 lines) with your question; ask Claude to expand on it if you need more.
+2. Claude replies with a line starting `**Answer:**`. The plugin pins it with your question the moment Claude writes it, even in the middle of a long turn. It keeps that paragraph up to the first blank line, at most 3 lines, and cuts anything past about 240 characters at a sentence end. Markdown shows as styles: bold, `code` in color, and list items as bullets. Ask Claude to expand on it if you need more.
 3. The pane opens:
    - in fullscreen mode at 110 columns or wider, it docks beside the chat;
    - otherwise it sits above the prompt.
    It is sized to its content, capped at 72 columns by 14 rows, showing the 5 newest answers.
 4. To clear answers:
    - press **✓ seen** to clear one;
-   - type `ack` to clear them all. The message can carry more after `ack`, like `ack, and also …`.
+   - type `ack` to clear them all. The message can carry more after `ack`, like `ack, and also …`;
+   - or just keep working: the next prompt you write starts a one-minute timer, and the answers already pinned clear when it ends. An answer pinned after that prompt waits for the next one. Nothing clears on time alone.
 5. `/pins` reopens the pane.
 
 The plugin keeps the last 20 answers. A reply whose Answer line is `n/a` isn't pinned.
