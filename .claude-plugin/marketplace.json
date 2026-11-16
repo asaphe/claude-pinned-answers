@@ -6,7 +6,7 @@
     {
       "name": "pinned-answers",
       "source": "./",
-      "description": "Pins the full answer to each question in a pane beside the chat until you type ack."
+      "description": "Pins the answer to each question in a pane beside the chat until you type ack."
     }
   ]
 }
