@@ -70,7 +70,7 @@ test('only the Answer paragraph is pinned, and ack closes the pane', async ($, o
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /keep it open/ }))?.text).toBe('yes, keep it open.')
   expect(await ui.find({ type: 'Text', text: /reason one|ACTION NEEDED/ })).toBeUndefined()
-  expect((await ui.find({ type: 'Text', text: /ack clears all/ }))?.text).toContain('next prompt clears these in 1m')
+  expect((await ui.find({ type: 'Text', text: /ack clears all/ }))?.text).toContain('your next prompt clears these after 1m')
   await ui.unmount()
 
   await $.prompt.submit({ text: 'ack' } as never)
@@ -85,13 +85,15 @@ test('only the Answer paragraph is pinned, and ack closes the pane', async ($, o
 })
 
 test('an Answer written mid-turn pins before the turn ends', async ($, on) => {
-  const { opened } = wire(on)
+  const { opened, clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   // Typed while a long turn runs: the engine stamps the running turn's id.
   await $.prompt.submit({ text: 'is the queue healthy?', turnId: 'long', wait: false } as never)
   await $.session.append(block('Checking the workers.', 'r1'))
+  await clock.settle()
   expect(opened.length).toBe(0)
   await $.session.append(block('**Answer:** yes, all 5 workers are up.\n\nDetails follow.', 'r2'))
+  await clock.settle()
   expect(opened.length).toBe(1)
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /workers are up/ }))?.text).toBe('yes, all 5 workers are up.')
@@ -100,6 +102,7 @@ test('an Answer written mid-turn pins before the turn ends', async ($, on) => {
   // A later Answer to the same question in the same turn replaces the pin, and a subagent's never pins.
   await $.session.append(block('**Answer:** no, 42 jobs failed on the client side.', 'r3'))
   await $.session.append(block('**Answer:** from a subagent', 'r4', 'agent-1'))
+  await clock.settle()
   // The turn's final text has no Answer line; the pin stays.
   await $.turn.complete(done('Done with the long turn.', 'long'))
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -109,10 +112,11 @@ test('an Answer written mid-turn pins before the turn ends', async ($, on) => {
 })
 
 test('markdown renders as styles and a long answer is cut at a sentence', async ($, on) => {
-  wire(on)
+  const { clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.prompt.submit({ text: 'why did jobs fail?' } as never)
   await $.session.append(block(SIZING, 'r1'))
+  await clock.settle()
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const line = await ui.find({ type: 'Text', text: /number of workers/ })
   expect(line?.text).toBe(
@@ -124,12 +128,87 @@ test('markdown renders as styles and a long answer is cut at a sentence', async 
 
   await $.prompt.submit({ text: 'what changed?' } as never)
   await $.session.append(block('**Answer:** `worker` scaled, see **below**:\n- replicas 5 → 12\n* limits _kept_', 'r2'))
+  await clock.settle()
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const all = await ui.findAll({ type: 'Text' })
   expect(all.some(t => /\*\*|`/.test(t.text))).toBe(false)
   expect((await ui.find({ type: 'Text', text: /^worker$/ }))?.props.color).toBe('permission')
   expect((await ui.find({ type: 'Text', text: /replicas 5/ }))?.text).toBe('• replicas 5 → 12')
   expect((await ui.find({ type: 'Text', text: /limits/ }))?.text).toBe('• limits _kept_')
+  await ui.unmount()
+
+  // Names and globs keep their underscores and stars.
+  await $.prompt.submit({ text: 'which files?' } as never)
+  await $.session.append(block('**Answer:** edit __init__.py and *.tf and *.md files', 'r3'))
+  await clock.settle()
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /init/ }))?.text).toBe('edit __init__.py and *.tf and *.md files')
+  await ui.unmount()
+
+  // The first Answer outside a code fence wins; a fenced or later example line never replaces it.
+  await $.prompt.submit({ text: 'what is the format?' } as never)
+  await $.session.append(block('```\n**Answer:** <fenced example>\n```\n**Answer:** one bold line.\n\n**Answer:** <one sentence>', 'r4'))
+  await clock.settle()
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /one bold line|example|one sentence/ }))?.text).toBe('one bold line.')
+  await ui.unmount()
+})
+
+test('a note typed mid-turn keeps the question armed; a dismissed pin never returns', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'is the queue healthy?' } as never)
+  await $.prompt.submit({ text: 'also check the logs', turnId: 'long', wait: false } as never)
+  await $.session.append(block('**Answer:** yes, healthy.', 'r1'))
+  await clock.settle()
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /healthy\./ }))?.text).toBe('yes, healthy.')
+  await ui.press({ key: (await ui.find({ type: 'Button' }))?.key ?? 'missing-button' })
+  await ui.unmount()
+
+  // The final message repeats the Answer: the dismissed pin stays gone, and the question is done.
+  await $.turn.complete(done('**Answer:** yes, healthy.', 'long'))
+  await $.turn.complete(done('**Answer:** a later reply', 'other'))
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text' }))?.text).toBe('Nothing pinned.')
+  await ui.unmount()
+})
+
+test('an unanswered question that opened its turn is disarmed at turn end', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'why did the deploy fail?' } as never)
+  await $.turn.complete(done('Looking into it.', 't1'))
+  // A notification's turn writes an Answer line: it is not the answer to the old question.
+  await $.prompt.submit({ text: '<task-notification>done</task-notification>' } as never)
+  await $.turn.complete(done('**Answer:** the backup finished.', 't2'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text' }))?.text).toBe('Nothing pinned.')
+  await ui.unmount()
+})
+
+test('each pin clears on its own time, and the timer never reopens a hidden pane', async ($, on) => {
+  const { clock, opened } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'is A up?' } as never)
+  await $.turn.complete(done('**Answer:** A is up.', 't1'))
+  await $.prompt.submit({ text: 'is B up?' } as never)
+  await $.turn.complete(done('**Answer:** B is up.', 't2'))
+  await clock.advance(30_000)
+  await $.prompt.submit({ text: 'thanks, carry on' } as never)
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /ack clears all/ }))?.text).toBe('ack clears all')
+  await ui.unmount()
+  const before = opened.length
+  await clock.advance(31_000)
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /A is up/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /B is up/ })).toBeDefined()
+  await ui.unmount()
+  expect(opened.length).toBe(before)
+  await clock.advance(30_000)
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text' }))?.text).toBe('Nothing pinned.')
   await ui.unmount()
 })
 
