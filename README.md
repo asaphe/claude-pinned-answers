@@ -5,11 +5,11 @@ Answers to your questions get lost in long replies and scrollback. This Claude C
 ## How it works
 
 1. You ask something: the prompt contains `?`, or starts with why, what, how, is, can, did, should, and so on.
-2. Claude replies with a line starting `**Answer:**`. The plugin pins everything from that line to the end of the reply, together with your question.
+2. Claude replies with a line starting `**Answer:**`. The plugin pins that paragraph (up to the first blank line, at most 3 lines) with your question; ask Claude to expand on it if you need more.
 3. The pane opens:
    - in fullscreen mode at 110 columns or wider, it docks beside the chat;
    - otherwise it sits above the prompt.
-   It is sized to its content, so lines don't wrap, up to the 45% of terminal width the dock allows.
+   It is sized to its content, capped at 72 columns by 14 rows, showing the 5 newest answers.
 4. To clear answers:
    - press **✓ seen** to clear one;
    - type `ack` to clear them all. The message can carry more after `ack`, like `ack, and also …`.
