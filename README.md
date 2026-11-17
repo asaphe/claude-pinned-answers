@@ -1,6 +1,6 @@
 # pinned-answers
 
-Answers to your questions get lost in long replies and scrollback. This Claude Code plugin keeps the answer on screen in a pane beside the chat until you say you've seen it.
+Answers to your questions get lost in long replies and scrollback. This Claude Code plugin keeps the answer on screen in a pane beside the chat until you dismiss it with one key.
 
 ## How it works
 
@@ -11,8 +11,7 @@ Answers to your questions get lost in long replies and scrollback. This Claude C
    - otherwise it sits above the prompt.
    It is sized to its content, capped at 72 columns by 14 rows, showing the 5 newest answers.
 4. To clear answers:
-   - press **✓ seen** to clear one;
-   - type `ack` to clear them all. The message can carry more after `ack`, like `ack, and also …`;
+   - press `0` while the prompt is empty: a row above the prompt reads `📌 Answer pinned   0: Dismiss`, like Claude Code's own feedback survey, and clears them all. A `0` typed after other text is ordinary input, and the row steps aside while a survey is showing;
    - or just keep working: the next prompt you write starts a one-minute timer, and the answers already pinned clear when it ends. An answer pinned after that prompt waits for the next one. Nothing clears on time alone.
 5. `/pins` reopens the pane.
 

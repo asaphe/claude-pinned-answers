@@ -14,7 +14,6 @@ const QUESTION =
 // Harness-injected prompts (task notifications, other sessions, slash-command echoes) are never the person asking.
 const MACHINE =
   /^\s*(<[a-z-]+|Another Claude session sent a message:|This session is being continued|\/)/i
-const ACK = /^\s*ack(?:$|[\s.,;:!-])/i
 const CLEAR_MS = 60_000
 const MAX_COLUMNS = 72
 const MAX_ROWS = 14
@@ -99,10 +98,7 @@ function clock(ms: number): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-function hint(all: readonly Pin[]): string {
-  const older = all.length > SHOWN ? `+${all.length - SHOWN} older · ` : ''
-  return `${older}ack clears all${all.some(p => p.clearAt === undefined) ? ' · your next prompt clears these after 1m' : ''}`
-}
+const older = (all: readonly Pin[]) => (all.length > SHOWN ? `+${all.length - SHOWN} older` : '')
 
 const header = (p: Pin) => `${clock(p.at)} "${short(p.question)}"${p.clearAt === undefined ? '' : ` · clears ${clock(p.clearAt)}`}`
 
@@ -110,16 +106,16 @@ async function show($: EngineInterface) {
   const all = await read($, pins)
   const list = all.slice(0, SHOWN)
   if (list.length === 0) return $.ui.close({ id: PANE })
-  let w = Math.max(40, hint(all).length + 4)
+  let w = Math.max(40, older(all).length + 4)
   for (const p of list) {
     w = Math.max(w, header(p).length + 4)
     for (const line of p.answer.split('\n')) w = Math.max(w, width(line) + 4)
   }
   const columns = Math.min(w, MAX_COLUMNS)
   const lines = (n: number) => Math.max(1, Math.ceil(n / (columns - 4)))
-  let rows = lines(hint(all).length)
+  let rows = older(all) ? 1 : -1
   for (const p of list) {
-    rows += 3
+    rows += 2
     for (const line of p.answer.split('\n')) rows += lines(width(line))
   }
   await $.ui.open({ id: PANE, title: TITLE, columns, rows: Math.min(rows, MAX_ROWS), closeOnEscape: true })
@@ -131,10 +127,10 @@ async function disarm($: EngineInterface) {
   await update($, askedIn, () => '')
 }
 
-async function clear($: EngineInterface) {
+// Drops every pin and leaves any armed question armed: 0 can be pressed mid-turn, after the next question was asked.
+async function dismiss($: EngineInterface) {
   timer?.cancel()
   await update($, pins, () => [])
-  await disarm($)
   await $.ui.close({ id: PANE })
 }
 
@@ -194,9 +190,8 @@ export const register: Register = on => {
     if (e.command || e.isMeta) return next(e)
     // Never hold a prompt back on this mod's own failure.
     await (async () => {
-      if (ACK.test(e.text)) return clear($)
       if (MACHINE.test(e.text)) return
-      // Your own prompt starts the clock on what is already pinned; ack still clears at once.
+      // Your own prompt starts the clock on what is already pinned; 0 in the band still clears at once.
       const now = await $.clock.now()
       if ((await read($, pins)).some(p => p.clearAt === undefined)) {
         await update($, pins, l => l.map(p => (p.clearAt === undefined ? { ...p, clearAt: now + CLEAR_MS } : p)))
@@ -239,15 +234,15 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
+    const { Box, Text } = $.ui.resolve(e)
     const all = await read($, pins)
     if (all.length === 0) return <Text dimColor>Nothing pinned.</Text>
     const list = all.slice(0, SHOWN)
     return (
       <Box flexDirection="column">
-        <Text dimColor>{hint(all)}</Text>
+        {older(all) ? <Text dimColor>{older(all)}</Text> : null}
         {list.map((p, i) => (
-          <Box key={p.id} flexDirection="column" marginTop={1}>
+          <Box key={p.id} flexDirection="column" marginTop={i === 0 && !older(all) ? 0 : 1}>
             <Text dimColor wrap="truncate-end">
               {header(p)}
             </Text>
@@ -268,17 +263,23 @@ export const register: Register = on => {
                 )}
               </Text>
             ))}
-            <Button
-              key={`seen-${p.id}`}
-              label={i === 0 ? '✓ seen (s)' : '✓ seen'}
-              hotkey={i === 0 ? 's' : undefined}
-              onPress={async () => {
-                const left = await update($, pins, l => l.filter(x => x.id !== p.id))
-                if (left.length === 0) await $.ui.close({ id: PANE })
-              }}
-            />
           </Box>
         ))}
+      </Box>
+    )
+  })
+
+  // The survey's shape: a bare 0 typed into an empty prompt presses this; any other key types as usual.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const all = await read($, pins)
+    if (all.length === 0 || e.props.hasSurvey) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="row">
+        <Text dimColor>{`📌 ${all.length === 1 ? 'Answer pinned' : `${all.length} answers pinned`}   `}</Text>
+        <Button key="dismiss" hotkey="0" plain onPress={() => dismiss($)}>
+          Dismiss
+        </Button>
       </Box>
     )
   })
