@@ -1,12 +1,12 @@
 {
   "name": "claude-pinned-answers",
-  "description": "Keeps the answer to your question on screen until you say you've seen it.",
+  "description": "Keeps the answer to your question on screen until you dismiss it with one key.",
   "owner": { "name": "asaphe" },
   "plugins": [
     {
       "name": "pinned-answers",
       "source": "./",
-      "description": "Pins the answer to each question in a pane beside the chat until you type ack."
+      "description": "Pins the answer to each question in a pane beside the chat until you press 0 to dismiss it."
     }
   ]
 }

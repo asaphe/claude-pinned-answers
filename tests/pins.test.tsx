@@ -15,6 +15,22 @@ const PANE = {
   },
 } as const
 
+const BAND = (hasSurvey = false) =>
+  ({
+    plugin: 'pinned-answers',
+    component: 'AbovePrompt',
+    surface: 'terminal',
+    props: {
+      hasSurvey,
+      isCollapsed: false,
+      isWorking: false,
+      maxRows: 10,
+      bodyColumns: 80,
+      scroll: { offset: 0, bodyRows: 9 },
+      view: {},
+    },
+  }) as const
+
 const REPLY = [
   'Some lead-in.',
   '**Answer:** yes, keep it open.',
@@ -60,7 +76,7 @@ const block = (text: string, uuid: string, agentId?: string) =>
     ...(agentId ? { agentId } : {}),
   }) as never
 
-test('only the Answer paragraph is pinned, and ack closes the pane', async ($, on) => {
+test('only the Answer paragraph is pinned, and 0: Dismiss in the band closes the pane', async ($, on) => {
   const { opened, closed } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.prompt.submit({ text: 'should we keep this session open?' } as never)
@@ -70,16 +86,24 @@ test('only the Answer paragraph is pinned, and ack closes the pane', async ($, o
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /keep it open/ }))?.text).toBe('yes, keep it open.')
   expect(await ui.find({ type: 'Text', text: /reason one|ACTION NEEDED/ })).toBeUndefined()
-  expect((await ui.find({ type: 'Text', text: /ack clears all/ }))?.text).toContain('your next prompt clears these after 1m')
+  expect(await ui.find({ type: 'Text', text: /\back\b|seen/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button' })).toBeUndefined()
   await ui.unmount()
 
-  await $.prompt.submit({ text: 'ack' } as never)
-  expect(closed.length).toBeGreaterThan(0)
+  const band = await $.ui.mount(BAND())
+  expect((await band.find({ type: 'Text', text: /pinned/ }))?.text).toContain('Answer pinned')
+  const dismiss = await band.find({ type: 'Button' })
+  expect(dismiss?.props.hotkey).toBe('0')
+  expect(dismiss?.props.plain).toBe(true)
+  const closedBefore = closed.length
+  await band.press({ key: 'dismiss' })
+  await band.unmount()
+  expect(closed.slice(closedBefore)).toEqual([expect.objectContaining({ id: 'pinned-answers' })])
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text' }))?.text).toBe('Nothing pinned.')
   await ui.unmount()
 
-  // The ack turn's own completion reopens nothing.
+  // A later turn's completion reopens nothing.
   await $.turn.complete(done('ok, cleared', 't2'))
   expect(opened.length).toBe(1)
 })
@@ -163,8 +187,10 @@ test('a note typed mid-turn keeps the question armed; a dismissed pin never retu
   await clock.settle()
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /healthy\./ }))?.text).toBe('yes, healthy.')
-  await ui.press({ key: (await ui.find({ type: 'Button' }))?.key ?? 'missing-button' })
   await ui.unmount()
+  const band = await $.ui.mount(BAND())
+  await band.press({ key: 'dismiss' })
+  await band.unmount()
 
   // The final message repeats the Answer: the dismissed pin stays gone, and the question is done.
   await $.turn.complete(done('**Answer:** yes, healthy.', 'long'))
@@ -197,7 +223,7 @@ test('each pin clears on its own time, and the timer never reopens a hidden pane
   await clock.advance(30_000)
   await $.prompt.submit({ text: 'thanks, carry on' } as never)
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /ack clears all/ }))?.text).toBe('ack clears all')
+  expect((await ui.findAll({ type: 'Text', text: /clears \d\d:\d\d/ })).length).toBe(2)
   await ui.unmount()
   const before = opened.length
   await clock.advance(31_000)
@@ -212,7 +238,7 @@ test('each pin clears on its own time, and the timer never reopens a hidden pane
   await ui.unmount()
 })
 
-test('your next prompt starts a 60s clear; time alone and ack behave as before', async ($, on) => {
+test('your next prompt starts a 60s clear; time alone and 0: Dismiss behave as before', async ($, on) => {
   const { clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.prompt.submit({ text: 'is it up?' } as never)
@@ -238,14 +264,16 @@ test('your next prompt starts a 60s clear; time alone and ack behave as before',
   expect((await ui.find({ type: 'Text' }))?.text).toBe('Nothing pinned.')
   await ui.unmount()
 
-  // A pin that lands after the prompt waits for the next one; ack still clears at once.
+  // A pin that lands after the prompt waits for the next one; 0: Dismiss still clears at once.
   await $.prompt.submit({ text: 'what version?' } as never)
   await $.turn.complete(done('**Answer:** v2.4.1.', 't3'))
   await clock.advance(5 * 60_000)
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /v2\.4\.1/ })).toBeDefined()
   await ui.unmount()
-  await $.prompt.submit({ text: 'ack' } as never)
+  const band = await $.ui.mount(BAND())
+  await band.press({ key: 'dismiss' })
+  await band.unmount()
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text' }))?.text).toBe('Nothing pinned.')
   await ui.unmount()
@@ -295,4 +323,41 @@ test('non-questions, machine prompts, unbolded and n/a lines pin nothing', async
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text' }))?.text).toBe('Nothing pinned.')
   await ui.unmount()
+})
+
+test('the band shows only while something is pinned, and yields to a survey', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  let band = await $.ui.mount(BAND())
+  expect(await band.find({ type: 'Button' })).toBeUndefined()
+  await band.unmount()
+
+  for (const q of ['is A up?', 'is B up?']) {
+    await $.prompt.submit({ text: q } as never)
+    await $.turn.complete(done(`**Answer:** ${q.slice(3, 4)} is up.`, q))
+  }
+  band = await $.ui.mount(BAND())
+  expect((await band.find({ type: 'Text', text: /pinned/ }))?.text).toContain('2 answers pinned')
+  await band.unmount()
+
+  band = await $.ui.mount(BAND(true))
+  expect(await band.find({ type: 'Button' })).toBeUndefined()
+  await band.unmount()
+
+  // 0 pressed mid-turn, after the next question went in, still lets that question's answer pin.
+  await $.prompt.submit({ text: 'is C up?', turnId: 'c', wait: false } as never)
+  band = await $.ui.mount(BAND())
+  await band.press({ key: 'dismiss' })
+  await band.unmount()
+  await $.turn.complete(done('**Answer:** C is up.', 'c'))
+  let pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await pane.find({ type: 'Text', text: /C is up/ }))?.text).toBe('C is up.')
+  expect(await pane.find({ type: 'Text', text: /A is up|B is up/ })).toBeUndefined()
+  await pane.unmount()
+
+  // Typing ack is an ordinary prompt now: it clears nothing.
+  await $.prompt.submit({ text: 'ack' } as never)
+  pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await pane.find({ type: 'Text', text: /C is up/ })).toBeDefined()
+  await pane.unmount()
 })
