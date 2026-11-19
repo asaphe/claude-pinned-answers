@@ -543,3 +543,77 @@ test('a question sent twice over one turn is armed once', async ($, on) => {
   await clock.settle()
   expect(await pinned($)).toEqual(['is B up? => B is up.', 'status? => green.'])
 })
+
+test('a question the model never reads expires, and a later notification turn cannot arm it', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'deploy A' } as never)
+  await $.turn.start({ text: 'deploy A', turnId: 't1' })
+  await $.prompt.submit({ ...me, text: 'status?', turnId: 't1', wait: false } as never)
+  await $.turn.complete(done('Deployed A.', 't1'))
+  await $.prompt.submit({ ...me, text: 'deploy B now' } as never)
+  await $.turn.start({ text: 'deploy B now', turnId: 't2' })
+  await $.turn.complete(done('Deployed B.', 't2'))
+  await $.prompt.submit({ text: 'job finished. status? see log', origin: { kind: 'task-notification' } } as never)
+  await $.turn.start({ text: 'job finished. status? see log', turnId: 't3' })
+  await $.session.append(block('**Answer:** machine text.', 'r3'))
+  await clock.settle()
+  await $.turn.complete(done('**Answer:** machine text.', 't3'))
+  expect(await pinned($)).toEqual([])
+})
+
+test('a doubled question mark mid-sentence is a question; x ?? y is not', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (const [i, q] of ['deployed?? the build is red', "done?? it's been an hour", 'ready?? (asking again)'].entries()) {
+    await $.prompt.submit({ ...me, text: q } as never)
+    await $.turn.complete(done(`**Answer:** d${i}.`, `d${i}`))
+  }
+  expect((await pinned($)).length).toBe(3)
+  await $.prompt.submit({ ...me, text: 'set timeout to opts.t ?? 30 and redeploy' } as never)
+  await $.turn.complete(done('**Answer:** done.', 'd9'))
+  expect((await pinned($)).length).toBe(3)
+})
+
+test('a mid-turn recap does not give an earlier Answer to a question still waiting', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'is A up?' } as never)
+  await $.session.append(block('**Answer:** A is up.', 'r1'))
+  await $.prompt.submit({ ...me, text: 'is C up?', turnId: 't1', wait: false } as never)
+  await $.session.append(queued('is C up?', 'q1'))
+  await $.session.append(block('Recap:\n\n**Answer:** A is up.\n\n**Answer:** C is up.', 'r2'))
+  await clock.settle()
+  expect(await pinned($)).toEqual(['is C up? => C is up.', 'is A up? => A is up.'])
+})
+
+test('a revised pin keeps the clear time its prompt started', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'is A up?' } as never)
+  await $.session.append(block('**Answer:** A is up.', 'r1'))
+  await clock.settle()
+  await $.prompt.submit({ ...me, text: 'keep going', turnId: 't1', wait: false } as never)
+  await $.session.append(block('**Answer:** A is up, all 3 nodes.', 'r2'))
+  await clock.settle()
+  expect((await texts($)).some(t => /clears \d\d:\d\d/.test(t))).toBe(true)
+})
+
+test('a stale waiting question is not armed by a notification delivered mid-turn turns later', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'deploy A' } as never)
+  await $.prompt.submit({ ...me, text: 'status?', turnId: 't1', wait: false } as never)
+  await $.turn.complete(done('Deployed A.', 't1'))
+  for (const t of ['t2', 't3', 't4']) {
+    await $.prompt.submit({ ...me, text: `deploy ${t}` } as never)
+    await $.turn.start({ text: `deploy ${t}`, turnId: t })
+    await $.turn.complete(done('Deployed.', t))
+  }
+  await $.prompt.submit({ ...me, text: 'deploy t5' } as never)
+  await $.turn.start({ text: 'deploy t5', turnId: 't5' })
+  await $.session.append(queued('job done. status? ok', 'q5'))
+  await $.session.append(block('**Answer:** machine text.', 'r5'))
+  await clock.settle()
+  expect(await pinned($)).toEqual([])
+})

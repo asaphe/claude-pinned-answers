@@ -12,9 +12,10 @@ const FENCE = /^\s*(```|~~~)/
 // A run of question marks that is not optional chaining (`cfg?.region`), a URL query (`?ref=`) or `a ?? b`; "status??" counts.
 function asks(text: string): boolean {
   for (const m of text.matchAll(/\?+/g)) {
-    const after = text.slice((m.index ?? 0) + m[0].length)
+    const at = m.index ?? 0
+    const after = text.slice(at + m[0].length)
     if (/^[\w=&]|^\.\w/.test(after)) continue
-    if (m[0].length === 2 && /^\s+[\w"'`(\-[{]/.test(after)) continue
+    if (m[0].length === 2 && /\s/.test(text[at - 1] ?? '') && /^\s+[\w"'`(\-[{]/.test(after)) continue
     return true
   }
   return false
@@ -50,7 +51,7 @@ const armed = atom({ plugin: 'pinned-answers', key: 'armed' } as const, '')
 // Questions typed over a running turn, each until the model reads it: its queued_command row, or a later turn opening with it.
 const waiting = atom({ plugin: 'pinned-answers', key: 'waiting' } as const, '')
 
-type Waiting = { q: string; id: string; keys: string[] }
+type Waiting = { q: string; id: string; keys: string[]; ends?: number }
 type Armed = { q: string; id: string; done?: true }
 
 let timer: Timer | undefined
@@ -60,6 +61,8 @@ const said = new Map<string, string>()
 const gone = new Set<string>()
 // The last few rows and turn prompts read: a hook's rewrite can land after the text it rewrote was carried.
 const carried: string[] = []
+// The next turn opens with a notification or other machine prompt, never with a question the person queued.
+let machine = false
 // Pins in the order their blocks arrived, so the turn's end reads them settled.
 let chain: Promise<unknown> = Promise.resolve()
 const serial = <T,>(f: () => Promise<T>): Promise<T> => {
@@ -97,12 +100,7 @@ function labelEnds(reply: string): number[] {
 // Every Answer in a reply, in order; n/a ones are left out.
 export const extractAll = (reply: string) => labelEnds(reply).flatMap(start => para(reply, start) ?? [])
 
-// The first Answer paragraph (up to the first blank line), at most 3 lines and one clipped run; null when none or n/a.
-export function extract(reply: string): string | null {
-  const start = labelEnds(reply)[0]
-  return start === undefined ? null : para(reply, start)
-}
-
+// The Answer paragraph from a label (up to the first blank line), at most 3 lines and one clipped run; null when n/a.
 function para(reply: string, start: number): string | null {
   const para = (reply.slice(start).split(/\n[ \t]*\n/)[0] ?? '').trim()
   if (!para || /^n\/a\b/i.test(para)) return null
@@ -196,6 +194,7 @@ async function deliver($: EngineInterface, raw: string, only?: { id: string; key
   const text = norm(raw)
   if (!text) return
   if (!only) carried.splice(0, carried.length, ...[...carried, text].slice(-3))
+  else if (!carried.includes(text)) return
   const keys = (w: Waiting) => (only ? (w.id === only.id ? [only.key] : []) : w.keys)
   const key = (w: Waiting) => keys(w).map(k => k.slice(0, KEY_CHARS)).find(k => text.includes(k))
   const hit = (await waitList($)).filter(w => key(w) !== undefined)
@@ -245,7 +244,8 @@ async function prune($: EngineInterface) {
 // Each Answer goes to the first armed question still waiting; a block's first one, with none waiting, revises the newest pin.
 async function pin($: EngineInterface, reply: string, final = false): Promise<boolean> {
   let added = false
-  for (const [i, answer] of extractAll(reply).entries()) {
+  const answers = extractAll(reply)
+  for (const [i, answer] of answers.entries()) {
     const list = await armedList($)
     const open = list.find(x => !x.done)
     const t = open ?? (i === 0 && !final ? list[list.length - 1] : undefined)
@@ -253,9 +253,12 @@ async function pin($: EngineInterface, reply: string, final = false): Promise<bo
     if (t.done && !(await read($, pins)).some(p => p.id === t.id)) continue
     if (!t.done && gone.has(answer)) continue
     // A recap repeats what the turn already said: an Answer pinned for one question never revises or fills another's.
-    if ((final || t.done) && (said.get(answer) ?? t.id) !== t.id) continue
+    if ((final || t.done || answers.length > 1) && (said.get(answer) ?? t.id) !== t.id) continue
     const p: Pin = { id: t.id, at: await $.clock.now(), question: t.q, answer }
-    await update($, pins, l => [p, ...l.filter(x => x.id !== t.id)].slice(0, 20))
+    await update($, pins, l => {
+      const clearAt = l.find(x => x.id === t.id)?.clearAt
+      return [clearAt === undefined ? p : { ...p, clearAt }, ...l.filter(x => x.id !== t.id)].slice(0, 20)
+    })
     await setArmed($, l => l.map(x => (x.id === t.id ? { ...x, done: true } : x)))
     said.set(answer, t.id)
     added = true
@@ -281,6 +284,7 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
+    if (!e.command && e.turnId === undefined) machine = !PERSON.has(e.origin?.kind ?? '')
     if (e.command || e.isMeta || !PERSON.has(e.origin?.kind ?? '')) return next(e)
     // Never hold a prompt back on this mod's own failure.
     const asking = await (async () => {
@@ -332,7 +336,8 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (e.agentId === undefined) gone.clear()
-    if (e.agentId === undefined) await serial(() => deliver($, e.text)).catch(() => undefined)
+    if (e.agentId === undefined && !machine) await serial(() => deliver($, e.text)).catch(() => undefined)
+    if (e.agentId === undefined) machine = false
     return started
   })
 
@@ -356,6 +361,8 @@ export const register: Register = on => {
       said.clear()
       gone.clear()
       carried.length = 0
+      // Its own turn's end, then at most two queued turns ahead of it: past that the model is not going to read it.
+      await setWaiting($, l => l.map(w => ({ ...w, ends: (w.ends ?? 0) + 1 })).filter(w => w.ends <= 3))
       if ((await read($, pins)).length === 0) await $.ui.close({ id: PANE })
       else if (added) await show($)
     }).catch(() => undefined)
