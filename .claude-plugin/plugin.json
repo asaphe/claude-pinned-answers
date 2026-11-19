@@ -1,6 +1,6 @@
 {
   "name": "pinned-answers",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Keeps the answer to each question in a pane beside the chat until you press 0 to dismiss it",
   "author": { "name": "asaphe" },
   "license": "Apache-2.0",
