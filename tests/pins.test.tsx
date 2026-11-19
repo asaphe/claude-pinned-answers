@@ -53,6 +53,7 @@ function wire(on: On) {
   on('ui.close', (_, e) => (closed.push(e), { value: undefined }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => ({ text: e.text }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   return { opened, closed, clock }
 }
@@ -76,6 +77,24 @@ const block = (text: string, uuid: string, agentId?: string) =>
     ...(agentId ? { agentId } : {}),
   }) as never
 
+const me = { origin: { kind: 'composer' } } as const
+const bot = { origin: { kind: 'task-notification' } } as const
+
+// The row a prompt typed mid-turn reaches the model by, as 2.1.328 raises it.
+const queued = (text: string, uuid: string) =>
+  ({
+    message: {
+      type: 'attachment',
+      name: 'queued_command',
+      role: 'user',
+      isMeta: true,
+      content: [{ type: 'text', text: `<system-reminder>\nThe user sent a new message while you were working:\n${text}\n</system-reminder>` }],
+    },
+    door: 'delivery',
+    origin: { kind: 'composer' },
+    uuid,
+  }) as never
+
 const result = (uuid: string) =>
   ({
     message: { type: 'user', role: 'user', content: [{ type: 'tool_result', tool_use_id: `tu-${uuid}`, content: 'ok' }] },
@@ -87,7 +106,7 @@ const result = (uuid: string) =>
 test('only the Answer paragraph is pinned, and 0: Dismiss in the band closes the pane', async ($, on) => {
   const { opened, closed } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'should we keep this session open?' } as never)
+  await $.prompt.submit({ ...me, text: 'should we keep this session open?' } as never)
   await $.turn.complete(done(REPLY, 't1'))
 
   expect(opened.length).toBe(1)
@@ -120,8 +139,9 @@ test('an Answer written mid-turn pins before the turn ends', async ($, on) => {
   const { opened, clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   // Typed while a long turn runs: the engine stamps the running turn's id.
-  await $.prompt.submit({ text: 'is the queue healthy?', turnId: 'long', wait: false } as never)
+  await $.prompt.submit({ ...me, text: 'is the queue healthy?', turnId: 'long', wait: false } as never)
   await $.session.append(result('r0'))
+  await $.session.append(queued('is the queue healthy?', 'q0'))
   await $.session.append(block('Checking the workers.', 'r1'))
   await clock.settle()
   expect(opened.length).toBe(0)
@@ -147,7 +167,7 @@ test('an Answer written mid-turn pins before the turn ends', async ($, on) => {
 test('markdown renders as styles and a long answer is cut at a sentence', async ($, on) => {
   const { clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'why did jobs fail?' } as never)
+  await $.prompt.submit({ ...me, text: 'why did jobs fail?' } as never)
   await $.session.append(block(SIZING, 'r1'))
   await clock.settle()
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -159,7 +179,7 @@ test('markdown renders as styles and a long answer is cut at a sentence', async 
   expect(bold.map(b => b.props.weight)).toEqual(['bold', 'bold'])
   await ui.unmount()
 
-  await $.prompt.submit({ text: 'what changed?' } as never)
+  await $.prompt.submit({ ...me, text: 'what changed?' } as never)
   await $.session.append(block('**Answer:** `worker` scaled, see **below**:\n- replicas 5 → 12\n* limits _kept_', 'r2'))
   await clock.settle()
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -171,7 +191,7 @@ test('markdown renders as styles and a long answer is cut at a sentence', async 
   await ui.unmount()
 
   // Names and globs keep their underscores and stars.
-  await $.prompt.submit({ text: 'which files?' } as never)
+  await $.prompt.submit({ ...me, text: 'which files?' } as never)
   await $.session.append(block('**Answer:** edit __init__.py and *.tf and *.md files', 'r3'))
   await clock.settle()
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -179,7 +199,7 @@ test('markdown renders as styles and a long answer is cut at a sentence', async 
   await ui.unmount()
 
   // The first Answer outside a code fence wins; a fenced or later example line never replaces it.
-  await $.prompt.submit({ text: 'what is the format?' } as never)
+  await $.prompt.submit({ ...me, text: 'what is the format?' } as never)
   await $.session.append(block('```\n**Answer:** <fenced example>\n```\n**Answer:** one bold line.\n\n**Answer:** <one sentence>', 'r4'))
   await clock.settle()
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -190,8 +210,8 @@ test('markdown renders as styles and a long answer is cut at a sentence', async 
 test('a note typed mid-turn keeps the question armed; a dismissed pin never returns', async ($, on) => {
   const { clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'is the queue healthy?' } as never)
-  await $.prompt.submit({ text: 'also check the logs', turnId: 'long', wait: false } as never)
+  await $.prompt.submit({ ...me, text: 'is the queue healthy?' } as never)
+  await $.prompt.submit({ ...me, text: 'also check the logs', turnId: 'long', wait: false } as never)
   await $.session.append(block('**Answer:** yes, healthy.', 'r1'))
   await clock.settle()
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -212,10 +232,10 @@ test('a note typed mid-turn keeps the question armed; a dismissed pin never retu
 test('an unanswered question that opened its turn is disarmed at turn end', async ($, on) => {
   wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'why did the deploy fail?' } as never)
+  await $.prompt.submit({ ...me, text: 'why did the deploy fail?' } as never)
   await $.turn.complete(done('Looking into it.', 't1'))
   // A notification's turn writes an Answer line: it is not the answer to the old question.
-  await $.prompt.submit({ text: '<task-notification>done</task-notification>' } as never)
+  await $.prompt.submit({ ...bot, text: '<task-notification>done</task-notification>' } as never)
   await $.turn.complete(done('**Answer:** the backup finished.', 't2'))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text' }))?.text).toBe('Nothing pinned.')
@@ -225,12 +245,12 @@ test('an unanswered question that opened its turn is disarmed at turn end', asyn
 test('each pin clears on its own time, and the timer never reopens a hidden pane', async ($, on) => {
   const { clock, opened } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'is A up?' } as never)
+  await $.prompt.submit({ ...me, text: 'is A up?' } as never)
   await $.turn.complete(done('**Answer:** A is up.', 't1'))
-  await $.prompt.submit({ text: 'is B up?' } as never)
+  await $.prompt.submit({ ...me, text: 'is B up?' } as never)
   await $.turn.complete(done('**Answer:** B is up.', 't2'))
   await clock.advance(30_000)
-  await $.prompt.submit({ text: 'thanks, carry on' } as never)
+  await $.prompt.submit({ ...me, text: 'thanks, carry on' } as never)
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.findAll({ type: 'Text', text: /clears \d\d:\d\d/ })).length).toBe(2)
   await ui.unmount()
@@ -250,7 +270,7 @@ test('each pin clears on its own time, and the timer never reopens a hidden pane
 test('your next prompt starts a 60s clear; time alone and 0: Dismiss behave as before', async ($, on) => {
   const { clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'is it up?' } as never)
+  await $.prompt.submit({ ...me, text: 'is it up?' } as never)
   await $.turn.complete(done('**Answer:** yes, it is up.', 't1'))
 
   // No prompt: the pin never times out.
@@ -259,7 +279,7 @@ test('your next prompt starts a 60s clear; time alone and 0: Dismiss behave as b
   expect(await ui.find({ type: 'Text', text: /it is up/ })).toBeDefined()
   await ui.unmount()
 
-  await $.prompt.submit({ text: 'now deploy it' } as never)
+  await $.prompt.submit({ ...me, text: 'now deploy it' } as never)
   await $.turn.complete(done('Deployed.', 't2'))
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /is it up/ }))?.text).toMatch(/· clears \d\d:\d\d$/)
@@ -274,7 +294,7 @@ test('your next prompt starts a 60s clear; time alone and 0: Dismiss behave as b
   await ui.unmount()
 
   // A pin that lands after the prompt waits for the next one; 0: Dismiss still clears at once.
-  await $.prompt.submit({ text: 'what version?' } as never)
+  await $.prompt.submit({ ...me, text: 'what version?' } as never)
   await $.turn.complete(done('**Answer:** v2.4.1.', 't3'))
   await clock.advance(5 * 60_000)
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -288,11 +308,12 @@ test('your next prompt starts a 60s clear; time alone and 0: Dismiss behave as b
   await ui.unmount()
 })
 
-test('a question the turn did not answer stays armed for the next turn', async ($, on) => {
+test('a question typed over a turn that never read it opens the next turn', async ($, on) => {
   wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'which node is it on?', turnId: 'busy', wait: false } as never)
-  await $.turn.complete(done('Finished the earlier task.', 'busy'))
+  await $.prompt.submit({ ...me, text: 'which node is it on?', turnId: 'busy', wait: false } as never)
+  await $.turn.complete(done('**Answer:** finished the earlier task.', 'busy'))
+  await $.turn.start({ text: 'which node is it on?', turnId: 'next' })
   await $.turn.complete(done('**Answer:** node worker-3.', 'next'))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /worker-3/ }))?.text).toBe('node worker-3.')
@@ -303,7 +324,7 @@ test('the pane is capped in size and a long answer is cut', async ($, on) => {
   const { opened } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   for (let i = 0; i < 8; i++) {
-    await $.prompt.submit({ text: `question ${i}?` } as never)
+    await $.prompt.submit({ ...me, text: `question ${i}?` } as never)
     await $.turn.complete(done(`**Answer:** ${'x'.repeat(400)}\nline2\nline3\nline4`, `t${i}`))
   }
   const last = opened[opened.length - 1]
@@ -320,13 +341,13 @@ test('the pane is capped in size and a long answer is cut', async ($, on) => {
 test('non-questions, machine prompts, unbolded and n/a lines pin nothing', async ($, on) => {
   wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'build the pane' } as never)
+  await $.prompt.submit({ ...me, text: 'build the pane' } as never)
   await $.turn.complete(done(REPLY, 't1'))
-  await $.prompt.submit({ text: '<task-notification>did it finish?</task-notification>' } as never)
+  await $.prompt.submit({ ...bot, text: '<task-notification>did it finish?</task-notification>' } as never)
   await $.turn.complete(done(REPLY, 't2'))
-  await $.prompt.submit({ text: 'is it done?' } as never)
+  await $.prompt.submit({ ...me, text: 'is it done?' } as never)
   await $.turn.complete(done('**Answer:** n/a', 't3'))
-  await $.prompt.submit({ text: 'is it done now?' } as never)
+  await $.prompt.submit({ ...me, text: 'is it done now?' } as never)
   await $.turn.complete(done('Answering that: it is.', 't4'))
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -342,7 +363,7 @@ test('the band shows only while something is pinned, and yields to a survey', as
   await band.unmount()
 
   for (const q of ['is A up?', 'is B up?']) {
-    await $.prompt.submit({ text: q } as never)
+    await $.prompt.submit({ ...me, text: q } as never)
     await $.turn.complete(done(`**Answer:** ${q.slice(3, 4)} is up.`, q))
   }
   band = await $.ui.mount(BAND())
@@ -354,11 +375,12 @@ test('the band shows only while something is pinned, and yields to a survey', as
   await band.unmount()
 
   // 0 pressed mid-turn, after the next question went in, still lets that question's answer pin.
-  await $.prompt.submit({ text: 'is C up?', turnId: 'c', wait: false } as never)
+  await $.prompt.submit({ ...me, text: 'is C up?', turnId: 'c', wait: false } as never)
   band = await $.ui.mount(BAND())
   await band.press({ key: 'dismiss' })
   await band.unmount()
   await $.session.append(result('c0'))
+  await $.session.append(queued('is C up?', 'q-c'))
   await $.turn.complete(done('**Answer:** C is up.', 'c'))
   let pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await pane.find({ type: 'Text', text: /C is up/ }))?.text).toBe('C is up.')
@@ -366,7 +388,7 @@ test('the band shows only while something is pinned, and yields to a survey', as
   await pane.unmount()
 
   // Typing ack is an ordinary prompt now: it clears nothing.
-  await $.prompt.submit({ text: 'ack' } as never)
+  await $.prompt.submit({ ...me, text: 'ack' } as never)
   pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await pane.find({ type: 'Text', text: /C is up/ })).toBeDefined()
   await pane.unmount()
@@ -375,8 +397,8 @@ test('the band shows only while something is pinned, and yields to a survey', as
 test('a question typed while the last reply is written waits for its own turn', async ($, on) => {
   const { clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'what is the slot count?' } as never)
-  await $.prompt.submit({ text: 'why only four?', turnId: 't1', wait: false } as never)
+  await $.prompt.submit({ ...me, text: 'what is the slot count?' } as never)
+  await $.prompt.submit({ ...me, text: 'why only four?', turnId: 't1', wait: false } as never)
   await $.session.append(block('**Answer:** 4 slots.', 'r1'))
   await clock.settle()
   await $.turn.complete(done('**Answer:** 4 slots.', 't1'))
@@ -384,6 +406,7 @@ test('a question typed while the last reply is written waits for its own turn', 
   expect((await ui.find({ type: 'Text', text: /4 slots/ }))?.text).toBe('4 slots.')
   expect(await ui.find({ type: 'Text', text: /why only four/ })).toBeUndefined()
   await ui.unmount()
+  await $.turn.start({ text: 'why only four?', turnId: 't2' })
   await $.turn.complete(done('**Answer:** the quota caps it.', 't2'))
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /why only four/ }))?.text).toContain('why only four?')
@@ -396,11 +419,11 @@ test('a question word opening any clause arms; imperatives and typed-in relays d
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   const asks = ['Relay setup -- what do we need to do and when', 'review my PRs. report status. what can merge', 'any replies', 'explain what you asked']
   for (const [i, q] of asks.entries()) {
-    await $.prompt.submit({ text: q } as never)
+    await $.prompt.submit({ ...me, text: q } as never)
     await $.turn.complete(done(`**Answer:** reply ${i}.`, `q${i}`))
   }
   for (const [i, q] of ['apply', 'go production', 'commit and push', '[merge-watch] repo#1 was merged (abc). If this session owns it, run the post-merge steps.'].entries()) {
-    await $.prompt.submit({ text: q } as never)
+    await $.prompt.submit({ ...me, text: q } as never)
     await $.turn.complete(done(`**Answer:** done ${i}.`, `i${i}`))
   }
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -412,9 +435,9 @@ test('a question word opening any clause arms; imperatives and typed-in relays d
 test('a prompt that opens with a paste is the person asking', async ($, on) => {
   wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: '<pasted_content id="a1">error: 401</pasted_content> why does this fail?' } as never)
+  await $.prompt.submit({ ...me, text: '<pasted_content id="a1">error: 401</pasted_content> why does this fail?' } as never)
   await $.turn.complete(done('**Answer:** the token expired.', 't1'))
-  await $.prompt.submit({ text: '<task-notification>why?</task-notification>' } as never)
+  await $.prompt.submit({ ...bot, text: '<task-notification>why?</task-notification>' } as never)
   await $.turn.complete(done('**Answer:** not for a notification.', 't2'))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /token expired/ }))?.text).toBe('the token expired.')
@@ -425,9 +448,10 @@ test('a prompt that opens with a paste is the person asking', async ($, on) => {
 test('a question typed over a turn that is then interrupted is the next turn\'s', async ($, on) => {
   wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'is A up?' } as never)
-  await $.prompt.submit({ text: 'is B up?', turnId: 't1', wait: false } as never)
-  await $.turn.complete({ ...done('', 't1'), isAborted: true, reason: 'aborted' })
+  await $.prompt.submit({ ...me, text: 'is A up?' } as never)
+  await $.prompt.submit({ ...me, text: 'is B up?', turnId: 't1', wait: false } as never)
+  await $.turn.complete({ ...done('**Answer:** A is up.', 't1'), isAborted: true, reason: 'aborted' })
+  await $.turn.start({ text: 'is B up?', turnId: 't2' })
   await $.turn.complete(done('**Answer:** B is up.', 't2'))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /is B up/ }))?.text).toContain('is B up?')
