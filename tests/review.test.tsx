@@ -234,10 +234,10 @@ test('a question entered as its turn ends opens the next turn, and leaks nowhere
   expect((await pinned($)).map(p => p.split(' => ')[0])).toEqual(['is it live?'])
 })
 
-test('only the person asks: notifications, peers, schedules and channels never arm; an SDK host does', async ($, on) => {
+test('only the person asks: notifications, peers, schedules and channels never arm', async ($, on) => {
   wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  const kinds = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'channel', 'coordinator', 'observer', 'unclassified']
+  const kinds = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'channel', 'coordinator', 'observer', 'sdk', 'unclassified']
   for (const [i, kind] of kinds.entries()) {
     await $.prompt.submit({ text: `why did job ${i} fail?`, origin: { kind, ...(kind === 'channel' ? { server: 's' } : {}) } } as never)
     await $.turn.complete(done(`**Answer:** machine ${i}.`, `m${i}`))
@@ -245,9 +245,7 @@ test('only the person asks: notifications, peers, schedules and channels never a
   expect(await pinned($)).toEqual([])
   await $.prompt.submit({ text: 'why did it fail?', origin: { kind: 'bridge' } } as never)
   await $.turn.complete(done('**Answer:** from the phone.', 'b1'))
-  await $.prompt.submit({ text: 'why did CI fail?', origin: { kind: 'sdk' } } as never)
-  await $.turn.complete(done('**Answer:** from the IDE.', 's1'))
-  expect(await pinned($)).toEqual(['why did CI fail? => from the IDE.', 'why did it fail? => from the phone.'])
+  expect(await pinned($)).toEqual(['why did it fail? => from the phone.'])
 })
 
 test('instructions that merely contain a question word do not arm', async ($, on) => {
@@ -427,4 +425,82 @@ test('an Answer dismissed in one turn does not block the same Answer to a later 
   await $.session.append(block('**Answer:** yes.', 'r2'))
   await clock.settle()
   expect(await pinned($)).toEqual(['is the database up? => yes.'])
+})
+
+test('an Answer and the next question read right after it both pin', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'is A up?' } as never)
+  await $.prompt.submit({ ...me, text: 'is B up?', turnId: 't1', wait: false } as never)
+  await $.session.append(block('**Answer:** A is up.', 'r1'))
+  await $.session.append(queued('is B up?', 'q1'))
+  await $.session.append(block('**Answer:** B is up.', 'r2'))
+  await clock.settle()
+  expect(await pinned($)).toEqual(['is B up? => B is up.', 'is A up? => A is up.'])
+})
+
+test('a rewritten question is not armed by an old turn that opened with the same text', async ($, on) => {
+  const { clock } = wire(on, e => ({ text: e.text.startsWith('is it up?') ? `${e.text} [ctx]` : e.text }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'is it up?' } as never)
+  await $.turn.start({ text: 'is it up? [ctx]', turnId: 't0' })
+  await $.turn.complete(done('**Answer:** yes.', 't0'))
+  await $.prompt.submit({ ...me, text: 'deploy it' } as never)
+  await $.turn.start({ text: 'deploy it', turnId: 't1' })
+  await $.prompt.submit({ ...me, text: 'is it up?', turnId: 't1', wait: false } as never)
+  await $.session.append(block('**Answer:** deploy started.', 'r1'))
+  await clock.settle()
+  expect((await pinned($)).map(p => p.split(' => ')[1])).not.toContain('deploy started.')
+})
+
+test('the second of two prompts queued behind a turn still arms in its own turn', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'deploy A' } as never)
+  await $.prompt.submit({ ...me, text: 'deploy B', turnId: 't1', wait: false } as never)
+  await $.prompt.submit({ ...me, text: 'is B healthy?', turnId: 't1', wait: false } as never)
+  await $.turn.complete(done('Deployed A.', 't1'))
+  await $.turn.start({ text: 'deploy B', turnId: 't2' })
+  await $.turn.complete(done('Deployed B.', 't2'))
+  await $.turn.start({ text: 'is B healthy?', turnId: 't3' })
+  await $.session.append(block('**Answer:** yes, healthy.', 'r3'))
+  await clock.settle()
+  expect(await pinned($)).toEqual(['is B healthy? => yes, healthy.'])
+})
+
+test('two Answers in one block go to two questions read together', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'deploy the fix' } as never)
+  await $.prompt.submit({ ...me, text: 'is A up?', turnId: 't1', wait: false } as never)
+  await $.prompt.submit({ ...me, text: 'is B up?', turnId: 't1', wait: false } as never)
+  await $.session.append(queued('is A up?', 'q0'))
+  await $.session.append(queued('is B up?', 'q1'))
+  await $.session.append(block('**Answer:** A is up.\n\n**Answer:** B is up.', 'r1'))
+  await clock.settle()
+  await $.turn.complete(done('**Answer:** A is up.\n\n**Answer:** B is up.', 't1'))
+  expect(await pinned($)).toEqual(['is B up? => B is up.', 'is A up? => A is up.'])
+})
+
+test('a revised Answer queued before the next question is read stays with its own question', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'is A up?' } as never)
+  await $.prompt.submit({ ...me, text: 'is B up?', turnId: 't1', wait: false } as never)
+  await $.session.append(block('**Answer:** A is up.', 'r1'))
+  await $.session.append(block('**Answer:** A is up, after a restart.', 'r2'))
+  await $.session.append(queued('is B up?', 'q1'))
+  await clock.settle()
+  expect(await pinned($)).toEqual(['is A up? => A is up, after a restart.'])
+})
+
+test('an unquoted ?? operator is not a question, a trailing ?? is', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'set region = cfg.region ?? us-east-1 and redeploy' } as never)
+  await $.turn.complete(done('**Answer:** done.', 'o1'))
+  expect(await pinned($)).toEqual([])
+  await $.prompt.submit({ ...me, text: 'status??' } as never)
+  await $.turn.complete(done('**Answer:** green.', 'o2'))
+  expect(await pinned($)).toEqual(['status?? => green.'])
 })

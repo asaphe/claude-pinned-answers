@@ -9,8 +9,16 @@ const TITLE = '📌 Pinned answers'
 const LABEL = /^[ \t>]*(?:\*\*|__)answer:?(?:\*\*|__):?[ \t]*/i
 const MARK = new RegExp(LABEL.source, 'im')
 const FENCE = /^\s*(```|~~~)/
-// A question mark that is not optional chaining (`cfg?.region`) or a URL query (`?ref=`); "status??" and "ready?..." count.
-const MARK_Q = /\?(?![\w=&])(?!\.\w)/
+// A run of question marks that is not optional chaining (`cfg?.region`), a URL query (`?ref=`) or `a ?? b`; "status??" counts.
+function asks(text: string): boolean {
+  for (const m of text.matchAll(/\?+/g)) {
+    const after = text.slice((m.index ?? 0) + m[0].length)
+    if (/^[\w=&]|^\.\w/.test(after)) continue
+    if (m[0].length === 2 && /^\s+[\w"'`(\-[{]/.test(after)) continue
+    return true
+  }
+  return false
+}
 const OPENER =
   /^\s*(?:(?:is|are|can|could|did|does|should|would|will)\b|do (?:we|you|i|they)\b|(?:explain|tell me)\s+(?:why|what|how|which|where|who|whether|if|about|this|that|it|the difference)\b)/i
 // A clause opening like a question ("Relay setup -- what do we need"), not "when done, push" or a SQL `WHERE` line.
@@ -22,10 +30,10 @@ const prose = (text: string) => text.replace(/```[\s\S]*?```|`[^`\n]*`/g, ' ')
 // Line breaks are kept: a question may open its own line ("deployed\nwhy is it slow").
 const isQuestion = (raw: string) => {
   const text = raw.replace(/[ \t]+/g, ' ').trim()
-  return MARK_Q.test(text) || OPENER.test(text) || CLAUSE.test(text)
+  return asks(text) || OPENER.test(text) || CLAUSE.test(text)
 }
-// The person's own Enter (terminal, Remote Control, or an SDK host such as an IDE); never a notification, peer or schedule.
-const PERSON = new Set(['composer', 'bridge', 'sdk'])
+// Only the person's own Enter, at the terminal or through Remote Control; never `claude -p`, a notification, peer or schedule.
+const PERSON = new Set(['composer', 'bridge'])
 const norm = (text: string) => text.replace(/\s+/g, ' ').trim()
 const KEY_CHARS = 200
 const CLEAR_MS = 60_000
@@ -42,7 +50,7 @@ const armed = atom({ plugin: 'pinned-answers', key: 'armed' } as const, '')
 // Questions typed over a running turn, each until the model reads it: its queued_command row, or a later turn opening with it.
 const waiting = atom({ plugin: 'pinned-answers', key: 'waiting' } as const, '')
 
-type Waiting = { q: string; id: string; keys: string[]; turn: string }
+type Waiting = { q: string; id: string; keys: string[] }
 type Armed = { q: string; id: string; done?: true }
 
 let timer: Timer | undefined
@@ -70,25 +78,32 @@ function clip(text: string): string {
   return text.slice(0, end).trimEnd()
 }
 
-// Offset just past the first Answer label outside a code fence, or -1.
-function labelEnd(reply: string): number {
+// Offsets just past each Answer label outside a code fence.
+function labelEnds(reply: string): number[] {
+  const out: number[] = []
   let fenced = false
   let at = 0
   for (const line of reply.split('\n')) {
     if (FENCE.test(line)) fenced = !fenced
     else if (!fenced) {
       const m = LABEL.exec(line)
-      if (m) return at + m[0].length
+      if (m) out.push(at + m[0].length)
     }
     at += line.length + 1
   }
-  return -1
+  return out
 }
+
+// Every Answer in a reply, in order; n/a ones are left out.
+export const extractAll = (reply: string) => labelEnds(reply).flatMap(start => para(reply, start) ?? [])
 
 // The first Answer paragraph (up to the first blank line), at most 3 lines and one clipped run; null when none or n/a.
 export function extract(reply: string): string | null {
-  const start = labelEnd(reply)
-  if (start < 0) return null
+  const start = labelEnds(reply)[0]
+  return start === undefined ? null : para(reply, start)
+}
+
+function para(reply: string, start: number): string | null {
   const para = (reply.slice(start).split(/\n[ \t]*\n/)[0] ?? '').trim()
   if (!para || /^n\/a\b/i.test(para)) return null
   const lines = para.split('\n').map(l => l.trimEnd())
@@ -162,26 +177,27 @@ function parse<T>(v: string): T[] {
 
 const armedList = async ($: EngineInterface) => parse<Armed>(await read($, armed))
 
-async function setArmed($: EngineInterface, fn: (l: Armed[]) => Armed[]) {
-  const next = fn(await armedList($)).slice(-5)
-  await update($, armed, () => (next.length ? JSON.stringify(next) : ''))
+// Inside `update`, so a write that lost a race is retried on the value that won.
+const write = <T,>(fn: (l: T[]) => T[]) => (v: string) => {
+  const next = fn(parse<T>(v)).slice(-5)
+  return next.length ? JSON.stringify(next) : ''
 }
+
+const setArmed = ($: EngineInterface, fn: (l: Armed[]) => Armed[]) => update($, armed, write(fn))
 
 const disarm = ($: EngineInterface) => setArmed($, () => [])
 
 const waitList = async ($: EngineInterface) => parse<Waiting>(await read($, waiting))
 
-async function setWaiting($: EngineInterface, fn: (l: Waiting[]) => Waiting[]) {
-  const next = fn(await waitList($)).slice(-5)
-  await update($, waiting, () => (next.length ? JSON.stringify(next) : ''))
-}
+const setWaiting = ($: EngineInterface, fn: (l: Waiting[]) => Waiting[]) => update($, waiting, write(fn))
 
 // Delivers every waiting question whose text the row or turn prompt carries; a shorter one inside a longer one's text is that one.
-async function deliver($: EngineInterface, raw: string, remember = true) {
+async function deliver($: EngineInterface, raw: string, only?: { id: string; key: string }) {
   const text = norm(raw)
   if (!text) return
-  if (remember) carried.splice(0, carried.length, ...[...carried, text].slice(-3))
-  const key = (w: Waiting) => w.keys.map(k => k.slice(0, KEY_CHARS)).find(k => text.includes(k))
+  if (!only) carried.splice(0, carried.length, ...[...carried, text].slice(-3))
+  const keys = (w: Waiting) => (only ? (w.id === only.id ? [only.key] : []) : w.keys)
+  const key = (w: Waiting) => keys(w).map(k => k.slice(0, KEY_CHARS)).find(k => text.includes(k))
   const hit = (await waitList($)).filter(w => key(w) !== undefined)
   const own = hit.filter(w => {
     const k = key(w) ?? ''
@@ -226,22 +242,25 @@ async function prune($: EngineInterface) {
   await arm($)
 }
 
-// The first armed question still waiting takes the Answer, else a later one revises the newest pin; the final message only fills a wait.
+// Each Answer goes to the first armed question still waiting; a block's first one, with none waiting, revises the newest pin.
 async function pin($: EngineInterface, reply: string, final = false): Promise<boolean> {
-  const list = await armedList($)
-  const answer = extract(reply)
-  if (list.length === 0 || !answer) return false
-  const open = list.find(x => !x.done)
-  const t = open ?? list[list.length - 1]
-  if (!t || (final && !open)) return false
-  if (t.done && !(await read($, pins)).some(p => p.id === t.id)) return false
-  if (!t.done && gone.has(answer)) return false
-  if (final && (said.get(answer) ?? t.id) !== t.id) return false
-  const p: Pin = { id: t.id, at: await $.clock.now(), question: t.q, answer }
-  await update($, pins, l => [p, ...l.filter(x => x.id !== t.id)].slice(0, 20))
-  await setArmed($, l => l.map(x => (x.id === t.id ? { ...x, done: true } : x)))
-  said.set(answer, t.id)
-  return true
+  let added = false
+  for (const [i, answer] of extractAll(reply).entries()) {
+    const list = await armedList($)
+    const open = list.find(x => !x.done)
+    const t = open ?? (i === 0 && !final ? list[list.length - 1] : undefined)
+    if (!t) break
+    if (t.done && !(await read($, pins)).some(p => p.id === t.id)) continue
+    if (!t.done && gone.has(answer)) continue
+    // The final message repeats what the turn already said: an Answer pinned for one question is not the next one's.
+    if (final && (said.get(answer) ?? t.id) !== t.id) continue
+    const p: Pin = { id: t.id, at: await $.clock.now(), question: t.q, answer }
+    await update($, pins, l => [p, ...l.filter(x => x.id !== t.id)].slice(0, 20))
+    await setArmed($, l => l.map(x => (x.id === t.id ? { ...x, done: true } : x)))
+    said.set(answer, t.id)
+    added = true
+  }
+  return added
 }
 
 export const register: Register = on => {
@@ -274,10 +293,9 @@ export const register: Register = on => {
       const own = unpasted(e.text)
       if (!isQuestion(prose(own))) return undefined
       const id = `${now}-${Math.random().toString(36).slice(2, 8)}`
-      const w: Waiting = { q: norm(own).slice(0, 120), id, keys: [norm(e.text)], turn: e.turnId ?? '' }
+      const w: Waiting = { q: norm(own).slice(0, 120), id, keys: [norm(e.text)] }
       // Typed over a running turn: listed before `next`, since the turn can end and the next one open with it before `next` returns.
-      if (e.turnId !== undefined) await setWaiting($, l => [...l, w])
-      else await setWaiting($, l => l.filter(x => !x.keys.includes(w.keys[0] ?? '')))
+      await setWaiting($, l => [...l.filter(x => !x.keys.includes(w.keys[0] ?? '')), ...(e.turnId !== undefined ? [w] : [])])
       return w
     })().catch(() => undefined)
     const r = await next(e)
@@ -288,7 +306,7 @@ export const register: Register = on => {
         if (asking && entered === undefined) await setWaiting($, l => l.filter(x => x.id !== asking.id))
         else if (asking && entered !== undefined && !asking.keys.includes(entered)) {
           await setWaiting($, l => l.map(x => (x.id === asking.id ? { ...x, keys: [...x.keys, entered] } : x)))
-          for (const c of [...carried]) await deliver($, c, false)
+          for (const c of [...carried]) await serial(() => deliver($, c, { id: asking.id, key: entered }))
         }
         // A note typed over a running turn leaves that turn's question armed.
         return
@@ -305,7 +323,7 @@ export const register: Register = on => {
     const kept = await next(e)
     if (e.agentId === undefined && e.message.type === 'attachment' && e.message.name === 'queued_command') {
       const text = e.message.content.flatMap(b => (b.type === 'text' ? [b.text] : [])).join('\n')
-      await deliver($, text).catch(() => undefined)
+      await serial(() => deliver($, text)).catch(() => undefined)
     }
     return kept
   })
@@ -314,7 +332,7 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
     if (e.agentId === undefined) gone.clear()
-    if (e.agentId === undefined) await deliver($, e.text).catch(() => undefined)
+    if (e.agentId === undefined) await serial(() => deliver($, e.text)).catch(() => undefined)
     return started
   })
 
@@ -337,8 +355,7 @@ export const register: Register = on => {
       await disarm($)
       said.clear()
       gone.clear()
-      // One typed over this turn and never read by it waits for the next turn; an older one the next turn did not open with is stale.
-      await setWaiting($, l => l.filter(w => w.turn === e.turnId))
+      carried.length = 0
       if ((await read($, pins)).length === 0) await $.ui.close({ id: PANE })
       else if (added) await show($)
     }).catch(() => undefined)
