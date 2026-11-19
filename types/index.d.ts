@@ -8,6 +8,7 @@ declare module 'claude-code' {
       asked: string
       askedIn: string
       answered: string
+      waiting: string
     }
   }
 }
