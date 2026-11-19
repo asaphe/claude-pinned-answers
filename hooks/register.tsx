@@ -9,11 +9,12 @@ const TITLE = '📌 Pinned answers'
 const LABEL = /^[ \t>]*(?:\*\*|__)answer:?(?:\*\*|__):?[ \t]*/i
 const MARK = new RegExp(LABEL.source, 'im')
 const FENCE = /^\s*(```|~~~)/
+// A question word may open any clause: "Relay setup -- what do we need", "report status. what can merge".
 const QUESTION =
-  /\?|^\s*(why|what|how|is|are|can|could|did|does|where|when|which|should|would|will)\b|^\s*do (we|you|i|they)\b/i
-// Harness-injected prompts (task notifications, other sessions, slash-command echoes) are never the person asking.
+  /\?|^\s*(is|are|can|could|did|does|should|would|will)\b|^\s*do (we|you|i|they)\b|^\s*(explain|tell me)\b|(?:^|[.!:;]\s+|\n\s*|--+\s*|—\s*)(why|what|how|which|when|where|who|whose|is there|are there|any (?:replies|reply|update|news|idea|reason))\b/i
+// Harness-injected prompts (task notifications, other sessions, slash-command echoes) are never the person asking; a prompt that opens with a paste is.
 const MACHINE =
-  /^\s*(<[a-z-]+|Another Claude session sent a message:|This session is being continued|\/)/i
+  /^\s*(<(?!pasted_content)[a-z-]+|Another Claude session sent a message:|This session is being continued|\/)/i
 const CLEAR_MS = 60_000
 const MAX_COLUMNS = 72
 const MAX_ROWS = 14
@@ -27,6 +28,8 @@ const question = atom({ plugin: 'pinned-answers', key: 'question' } as const, ''
 const asked = atom({ plugin: 'pinned-answers', key: 'asked' } as const, '')
 const askedIn = atom({ plugin: 'pinned-answers', key: 'askedIn' } as const, '')
 const answered = atom({ plugin: 'pinned-answers', key: 'answered' } as const, '')
+// A question typed over a running turn, until that turn reads it (its next tool result or queued_command row) or ends without it.
+const waiting = atom({ plugin: 'pinned-answers', key: 'waiting' } as const, '')
 
 let timer: Timer | undefined
 
@@ -127,6 +130,17 @@ async function disarm($: EngineInterface) {
   await update($, askedIn, () => '')
 }
 
+// The waiting question becomes the armed one: read mid-turn it stays for the next turn too, else it opens the next turn.
+async function deliver($: EngineInterface, midTurn: boolean) {
+  const w = await read($, waiting)
+  if (!w) return
+  const { q, id, turn } = JSON.parse(w) as { q: string; id: string; turn: string }
+  await update($, waiting, () => '')
+  await update($, question, () => q)
+  await update($, asked, () => id)
+  await update($, askedIn, () => (midTurn ? turn : ''))
+}
+
 // Drops every pin and leaves any armed question armed: 0 can be pressed mid-turn, after the next question was asked.
 async function dismiss($: EngineInterface) {
   timer?.cancel()
@@ -198,15 +212,29 @@ export const register: Register = on => {
         await arm($)
       }
       if (QUESTION.test(e.text)) {
-        await update($, question, () => e.text.replace(/\s+/g, ' ').trim().slice(0, 120))
-        await update($, asked, () => `${now}-${Math.random().toString(36).slice(2, 8)}`)
-        await update($, askedIn, () => e.turnId ?? '')
+        const q = e.text.replace(/\s+/g, ' ').trim().slice(0, 120)
+        const id = `${now}-${Math.random().toString(36).slice(2, 8)}`
+        // Typed over a running turn: that turn's Answer lines are not for it until the turn reads it.
+        if (e.turnId !== undefined) await update($, waiting, () => JSON.stringify({ q, id, turn: e.turnId }))
+        else {
+          await update($, question, () => q)
+          await update($, asked, () => id)
+          await update($, askedIn, () => '')
+        }
       } else if (e.turnId === undefined) {
         // A note typed over a running turn leaves that turn's question armed.
         await disarm($)
       }
     })().catch(() => undefined)
     return next(e)
+  })
+
+  // A prompt typed mid-turn rides the request after the next tool result (or its queued_command row): from then the turn has read it.
+  on('session.append', async ($, e, next) => {
+    const kept = await next(e)
+    const taken = e.door === 'tool-result' || (e.message.type === 'attachment' && e.message.name === 'queued_command')
+    if (e.agentId === undefined && taken) await deliver($, true).catch(() => undefined)
+    return kept
   })
 
   // Each response block as it is kept: the Answer line pins the moment it is written, mid-turn included.
@@ -221,12 +249,16 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId !== undefined || e.isAborted) return done
+    if (e.agentId !== undefined) return done
+    // Interrupted: a question typed over it runs next as its own turn.
+    if (e.isAborted) return (await deliver($, false).catch(() => undefined), done)
     await (async () => {
       const id = await read($, asked)
       const added = id !== '' && (await read($, answered)) !== id ? await pin($, e.answer) : false
       // Answered, or unanswered by a turn it was not typed over: done. One typed over this turn waits for the next.
       if (id && ((await read($, answered)) === id || (await read($, askedIn)) !== e.turnId)) await disarm($)
+      // Typed over this turn and never read by it: it opens the next turn.
+      if (await read($, waiting)) await deliver($, false)
       if ((await read($, pins)).length === 0) await $.ui.close({ id: PANE })
       else if (added) await show($)
     })().catch(() => undefined)

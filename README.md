@@ -4,11 +4,9 @@ Answers to your questions get lost in long replies and scrollback. This Claude C
 
 ## How it works
 
-1. You ask something: the prompt contains `?`, or starts with why, what, how, is, can, did, should, and so on.
+1. You ask something: the prompt contains `?`, starts with is, can, did, should, explain, tell me and so on, or has a clause that opens with why, what, how, which, when, where or who ("report status. what can merge"). A question you type while Claude is still working waits until that turn has read it, so an answer written before then is never pinned under it.
 2. Claude replies with a line starting `**Answer:**`. The plugin pins it with your question the moment Claude writes it, even in the middle of a long turn. It keeps that paragraph up to the first blank line, at most 3 lines, and cuts anything past about 240 characters at a sentence end. Markdown shows as styles: bold, `code` in color, and list items as bullets. Ask Claude to expand on it if you need more.
-3. The pane opens:
-   - in fullscreen mode at 110 columns or wider, it docks beside the chat;
-   - otherwise it sits above the prompt.
+3. The pane opens, docked beside the chat in fullscreen mode, otherwise above the prompt. Claude Code draws a pane a plugin opens on its own only in a terminal 144 columns or wider, or 110 once you have opened it with `/pins` and not closed it by hand since. In a narrower terminal the row above the prompt still reads `📌 Answer pinned`, and `/pins` shows the pane at any width.
    It is sized to its content, capped at 72 columns by 14 rows, showing the 5 newest answers.
 4. To clear answers:
    - press `0` while the prompt is empty: a row above the prompt reads `📌 Answer pinned   0: Dismiss`, like Claude Code's own feedback survey, and clears them all. A `0` typed after other text is ordinary input, and the row steps aside while a survey is showing;

@@ -76,6 +76,14 @@ const block = (text: string, uuid: string, agentId?: string) =>
     ...(agentId ? { agentId } : {}),
   }) as never
 
+const result = (uuid: string) =>
+  ({
+    message: { type: 'user', role: 'user', content: [{ type: 'tool_result', tool_use_id: `tu-${uuid}`, content: 'ok' }] },
+    door: 'tool-result',
+    origin: { kind: 'tool', tool: 'Bash' },
+    uuid,
+  }) as never
+
 test('only the Answer paragraph is pinned, and 0: Dismiss in the band closes the pane', async ($, on) => {
   const { opened, closed } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -113,6 +121,7 @@ test('an Answer written mid-turn pins before the turn ends', async ($, on) => {
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   // Typed while a long turn runs: the engine stamps the running turn's id.
   await $.prompt.submit({ text: 'is the queue healthy?', turnId: 'long', wait: false } as never)
+  await $.session.append(result('r0'))
   await $.session.append(block('Checking the workers.', 'r1'))
   await clock.settle()
   expect(opened.length).toBe(0)
@@ -349,6 +358,7 @@ test('the band shows only while something is pinned, and yields to a survey', as
   band = await $.ui.mount(BAND())
   await band.press({ key: 'dismiss' })
   await band.unmount()
+  await $.session.append(result('c0'))
   await $.turn.complete(done('**Answer:** C is up.', 'c'))
   let pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await pane.find({ type: 'Text', text: /C is up/ }))?.text).toBe('C is up.')
@@ -360,4 +370,67 @@ test('the band shows only while something is pinned, and yields to a survey', as
   pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await pane.find({ type: 'Text', text: /C is up/ })).toBeDefined()
   await pane.unmount()
+})
+
+test('a question typed while the last reply is written waits for its own turn', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'what is the slot count?' } as never)
+  await $.prompt.submit({ text: 'why only four?', turnId: 't1', wait: false } as never)
+  await $.session.append(block('**Answer:** 4 slots.', 'r1'))
+  await clock.settle()
+  await $.turn.complete(done('**Answer:** 4 slots.', 't1'))
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /4 slots/ }))?.text).toBe('4 slots.')
+  expect(await ui.find({ type: 'Text', text: /why only four/ })).toBeUndefined()
+  await ui.unmount()
+  await $.turn.complete(done('**Answer:** the quota caps it.', 't2'))
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /why only four/ }))?.text).toContain('why only four?')
+  expect((await ui.find({ type: 'Text', text: /quota/ }))?.text).toBe('the quota caps it.')
+  await ui.unmount()
+})
+
+test('a question word opening any clause arms; imperatives and typed-in relays do not', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const asks = ['Relay setup -- what do we need to do and when', 'review my PRs. report status. what can merge', 'any replies', 'explain what you asked']
+  for (const [i, q] of asks.entries()) {
+    await $.prompt.submit({ text: q } as never)
+    await $.turn.complete(done(`**Answer:** reply ${i}.`, `q${i}`))
+  }
+  for (const [i, q] of ['apply', 'go production', 'commit and push', '[merge-watch] repo#1 was merged (abc). If this session owns it, run the post-merge steps.'].entries()) {
+    await $.prompt.submit({ text: q } as never)
+    await $.turn.complete(done(`**Answer:** done ${i}.`, `i${i}`))
+  }
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const got = (await ui.findAll({ type: 'Text', text: /^(reply|done) \d\.$/ })).map(t => t.text).sort()
+  expect(got).toEqual(['reply 0.', 'reply 1.', 'reply 2.', 'reply 3.'])
+  await ui.unmount()
+})
+
+test('a prompt that opens with a paste is the person asking', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: '<pasted_content id="a1">error: 401</pasted_content> why does this fail?' } as never)
+  await $.turn.complete(done('**Answer:** the token expired.', 't1'))
+  await $.prompt.submit({ text: '<task-notification>why?</task-notification>' } as never)
+  await $.turn.complete(done('**Answer:** not for a notification.', 't2'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /token expired/ }))?.text).toBe('the token expired.')
+  expect(await ui.find({ type: 'Text', text: /notification/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a question typed over a turn that is then interrupted is the next turn\'s', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'is A up?' } as never)
+  await $.prompt.submit({ text: 'is B up?', turnId: 't1', wait: false } as never)
+  await $.turn.complete({ ...done('', 't1'), isAborted: true, reason: 'aborted' })
+  await $.turn.complete(done('**Answer:** B is up.', 't2'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /is B up/ }))?.text).toContain('is B up?')
+  expect(await ui.find({ type: 'Text', text: /is A up/ })).toBeUndefined()
+  await ui.unmount()
 })
