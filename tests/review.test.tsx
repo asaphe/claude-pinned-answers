@@ -149,7 +149,7 @@ test('two questions over one turn each keep their own answer', async ($, on) => 
   expect(await pinned($)).toEqual(['is B up? => B is up.', 'is A up? => A is up.'])
 })
 
-test('two questions read in one drain share the header of the answer that follows', async ($, on) => {
+test('two questions read in one drain take the Answers in order, and a repeat fills neither', async ($, on) => {
   const { clock } = wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
   await $.prompt.submit({ ...me, text: 'deploy the fix' } as never)
@@ -161,7 +161,7 @@ test('two questions read in one drain share the header of the answer that follow
   await $.session.append(block('**Answer:** both are up.', 'r1'))
   await clock.settle()
   await $.turn.complete(done('**Answer:** both are up.', 't1'))
-  expect(await pinned($)).toEqual(['is A up? · is B up? => both are up.'])
+  expect(await pinned($)).toEqual(['is A up? => both are up.'])
 })
 
 test('a mid-turn question a hook drops is never armed', async ($, on) => {
@@ -234,10 +234,10 @@ test('a question entered as its turn ends opens the next turn, and leaks nowhere
   expect((await pinned($)).map(p => p.split(' => ')[0])).toEqual(['is it live?'])
 })
 
-test('only the person asks: notifications, peers, schedules and channels never arm', async ($, on) => {
+test('only the person asks: notifications, peers, schedules and channels never arm; an SDK host does', async ($, on) => {
   wire(on)
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-  const kinds = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'channel', 'coordinator', 'observer', 'sdk', 'unclassified']
+  const kinds = ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'channel', 'coordinator', 'observer', 'unclassified']
   for (const [i, kind] of kinds.entries()) {
     await $.prompt.submit({ text: `why did job ${i} fail?`, origin: { kind, ...(kind === 'channel' ? { server: 's' } : {}) } } as never)
     await $.turn.complete(done(`**Answer:** machine ${i}.`, `m${i}`))
@@ -245,7 +245,9 @@ test('only the person asks: notifications, peers, schedules and channels never a
   expect(await pinned($)).toEqual([])
   await $.prompt.submit({ text: 'why did it fail?', origin: { kind: 'bridge' } } as never)
   await $.turn.complete(done('**Answer:** from the phone.', 'b1'))
-  expect(await pinned($)).toEqual(['why did it fail? => from the phone.'])
+  await $.prompt.submit({ text: 'why did CI fail?', origin: { kind: 'sdk' } } as never)
+  await $.turn.complete(done('**Answer:** from the IDE.', 's1'))
+  expect(await pinned($)).toEqual(['why did CI fail? => from the IDE.', 'why did it fail? => from the phone.'])
 })
 
 test('instructions that merely contain a question word do not arm', async ($, on) => {
@@ -316,4 +318,113 @@ test('a question queued behind a turn of any length is still delivered', async (
   await $.session.append(block('**Answer:** about an hour more.', 'r1'))
   await clock.settle()
   expect(await pinned($)).toEqual(['how long will it take? => about an hour more.'])
+})
+
+test('two questions read in one drain each keep their own answer', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'deploy the fix' } as never)
+  await $.prompt.submit({ ...me, text: 'is A up?', turnId: 't1', wait: false } as never)
+  await $.prompt.submit({ ...me, text: 'is B up?', turnId: 't1', wait: false } as never)
+  await $.session.append(result('r0'))
+  await $.session.append(queued('is A up?', 'q0'))
+  await $.session.append(queued('is B up?', 'q1'))
+  await $.session.append(block('**Answer:** A is up.', 'r1'))
+  await clock.settle()
+  await $.session.append(block('**Answer:** B is up.', 'r2'))
+  await clock.settle()
+  await $.turn.complete(done('**Answer:** B is up.', 't1'))
+  expect(await pinned($)).toEqual(['is B up? => B is up.', 'is A up? => A is up.'])
+})
+
+test('a question read mid-turn pins an Answer equal to the one before it', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'is the queue healthy?' } as never)
+  await $.session.append(block('**Answer:** Yes.', 'r1'))
+  await clock.settle()
+  await $.prompt.submit({ ...me, text: 'is the deploy done?', turnId: 't1', wait: false } as never)
+  await $.session.append(result('r2'))
+  await $.session.append(queued('is the deploy done?', 'q2'))
+  await $.session.append(block('**Answer:** Yes.', 'r3'))
+  await clock.settle()
+  await $.turn.complete(done('**Answer:** Yes.', 't1'))
+  expect(await pinned($)).toEqual(['is the deploy done? => Yes.', 'is the queue healthy? => Yes.'])
+})
+
+test('a question on its own line arms', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'deployed\nwhy is it slow' } as never)
+  await $.turn.complete(done('**Answer:** the disk.', 't1'))
+  expect(await pinned($)).toEqual(['deployed why is it slow => the disk.'])
+})
+
+test('a stale waiting question is not delivered by a later, longer one', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'deploy the fix' } as never)
+  await $.prompt.submit({ ...me, text: 'why?', turnId: 't1', wait: false } as never)
+  await $.turn.complete({ ...done('', 't1'), isAborted: true, reason: 'aborted' } as never)
+  // Esc pulled the queued prompt back into the input; the person edits it and sends it idle.
+  await $.prompt.submit({ ...me, text: 'retry the deploy' } as never)
+  await $.turn.start({ text: 'retry the deploy', turnId: 't2' })
+  await $.prompt.submit({ ...me, text: 'why? check the logs too', turnId: 't2', wait: false } as never)
+  await $.session.append(result('r0'))
+  await $.session.append(queued('why? check the logs too', 'q0'))
+  await $.session.append(block('**Answer:** the logs show a timeout.', 'r1'))
+  await clock.settle()
+  expect(await pinned($)).toEqual(['why? check the logs too => the logs show a timeout.'])
+})
+
+test('a rewritten question whose turn opens before next() returns is still delivered', async ($, on) => {
+  let release = () => {}
+  const gate = new Promise<void>(r => (release = r))
+  const { clock } = wire(on, async e => (e.text.includes('tok_') ? (await gate, { text: e.text.replace(/tok_\w+/, '[masked]') }) : { text: e.text }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'deploy the fix' } as never)
+  await $.turn.complete(done('Deployed.', 't1'))
+  const sent = $.prompt.submit({ ...me, text: 'is tok_abc valid?', turnId: 't1', wait: false } as never)
+  await clock.settle()
+  await $.turn.start({ text: 'is [masked] valid?', turnId: 't2' })
+  release()
+  await sent
+  await $.session.append(block('**Answer:** yes, still valid.', 'r1'))
+  await clock.settle()
+  await $.turn.complete(done('**Answer:** yes, still valid.', 't2'))
+  expect((await pinned($))[0]).toBe('is tok_abc valid? => yes, still valid.')
+})
+
+test('an Answer in the last block is pinned when turn.complete follows at once', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'is it up?' } as never)
+  await $.session.append(block('**Answer:** yes, up.\n\nDetails.', 'r1'))
+  await $.turn.complete(done('Done.', 't1'))
+  expect(await pinned($)).toEqual(['is it up? => yes, up.'])
+})
+
+test('doubled and trailing question marks arm', async ($, on) => {
+  wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  for (const [i, q] of ['status??', 'deployed?...'].entries()) {
+    await $.prompt.submit({ ...me, text: q } as never)
+    await $.turn.complete(done(`**Answer:** m${i}.`, `m${i}`))
+  }
+  expect((await pinned($)).length).toBe(2)
+})
+
+test('an Answer dismissed in one turn does not block the same Answer to a later question', async ($, on) => {
+  const { clock } = wire(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ ...me, text: 'is it up?' } as never)
+  await $.turn.complete(done('**Answer:** yes.', 't1'))
+  const band = await $.ui.mount(BAND)
+  await band.press({ key: 'dismiss' })
+  await band.unmount()
+  await $.prompt.submit({ ...me, text: 'is the database up?' } as never)
+  await $.turn.start({ text: 'is the database up?', turnId: 't2' })
+  await $.session.append(block('**Answer:** yes.', 'r2'))
+  await clock.settle()
+  expect(await pinned($)).toEqual(['is the database up? => yes.'])
 })

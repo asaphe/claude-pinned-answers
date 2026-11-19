@@ -4,9 +4,7 @@ declare module 'claude-code' {
   interface PluginState {
     'pinned-answers': {
       pins: Shaped<Pin[]>
-      question: string
-      asked: string
-      answered: string
+      armed: string
       waiting: string
     }
   }
