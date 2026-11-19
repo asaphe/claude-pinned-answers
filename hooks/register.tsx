@@ -23,7 +23,7 @@ const OPENER =
   /^\s*(?:(?:is|are|can|could|did|does|should|would|will)\b|do (?:we|you|i|they)\b|(?:explain|tell me)\s+(?:why|what|how|which|where|who|whether|if|about|this|that|it|the difference)\b)/i
 // A clause opening like a question ("Relay setup -- what do we need"), not "when done, push" or a SQL `WHERE` line.
 const CLAUSE =
-  /(?:^|[.!:;]\s+|\n\s*|--+\s*|—\s*)(?:why\b|(?:what|how|which|when|where|who|whose)(?:'s|\s+(?:is|are|was|were|do|does|did|can|could|should|would|will|has|have|had|about|many|much|long|often|else))\b|is there\b|are there\b|any (?:replies|reply|update|news|idea|reason)\b)/i
+  /(?:^|[.!:;]\s+|\n\s*|--+\s*|—\s*)(?:why\b(?!:)|(?:what|how|which|when|where|who|whose)(?:'s|\s+(?:is|are|was|were|do|does|did|can|could|should|would|will|has|have|had|about|many|much|long|often|else))\b|is there\b|are there\b|any (?:replies|reply|update|news|idea|reason)\b)/i
 // What the person typed around a paste: the paste is material, not the question.
 const unpasted = (text: string) => text.replace(/<pasted_content\b[^>]*>[\s\S]*?<\/pasted_content[^>]*>/g, ' ')
 const prose = (text: string) => text.replace(/```[\s\S]*?```|`[^`\n]*`/g, ' ')
@@ -252,8 +252,8 @@ async function pin($: EngineInterface, reply: string, final = false): Promise<bo
     if (!t) break
     if (t.done && !(await read($, pins)).some(p => p.id === t.id)) continue
     if (!t.done && gone.has(answer)) continue
-    // The final message repeats what the turn already said: an Answer pinned for one question is not the next one's.
-    if (final && (said.get(answer) ?? t.id) !== t.id) continue
+    // A recap repeats what the turn already said: an Answer pinned for one question never revises or fills another's.
+    if ((final || t.done) && (said.get(answer) ?? t.id) !== t.id) continue
     const p: Pin = { id: t.id, at: await $.clock.now(), question: t.q, answer }
     await update($, pins, l => [p, ...l.filter(x => x.id !== t.id)].slice(0, 20))
     await setArmed($, l => l.map(x => (x.id === t.id ? { ...x, done: true } : x)))
