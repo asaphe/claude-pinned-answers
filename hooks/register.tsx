@@ -9,8 +9,8 @@ const TITLE = '📌 Pinned answers'
 const LABEL = /^[ \t>]*(?:\*\*|__)answer:?(?:\*\*|__):?[ \t]*/i
 const MARK = new RegExp(LABEL.source, 'im')
 const FENCE = /^\s*(```|~~~)/
-// A question mark that is not an operator (`?.`, `??`) or a URL query (`?ref=`).
-const MARK_Q = /(?<!\?)\?(?![?.\w=&])/
+// A question mark that is not optional chaining (`cfg?.region`) or a URL query (`?ref=`); "status??" and "ready?..." count.
+const MARK_Q = /\?(?![\w=&])(?!\.\w)/
 const OPENER =
   /^\s*(?:(?:is|are|can|could|did|does|should|would|will)\b|do (?:we|you|i|they)\b|(?:explain|tell me)\s+(?:why|what|how|which|where|who|whether|if|about|this|that|it|the difference)\b)/i
 // A clause opening like a question ("Relay setup -- what do we need"), not "when done, push" or a SQL `WHERE` line.
@@ -19,9 +19,13 @@ const CLAUSE =
 // What the person typed around a paste: the paste is material, not the question.
 const unpasted = (text: string) => text.replace(/<pasted_content\b[^>]*>[\s\S]*?<\/pasted_content[^>]*>/g, ' ')
 const prose = (text: string) => text.replace(/```[\s\S]*?```|`[^`\n]*`/g, ' ')
-const isQuestion = (text: string) => MARK_Q.test(text) || OPENER.test(text) || CLAUSE.test(text)
-// Only the person's own Enter, at the terminal or through Remote Control, asks; never a notification, peer or schedule.
-const PERSON = new Set(['composer', 'bridge'])
+// Line breaks are kept: a question may open its own line ("deployed\nwhy is it slow").
+const isQuestion = (raw: string) => {
+  const text = raw.replace(/[ \t]+/g, ' ').trim()
+  return MARK_Q.test(text) || OPENER.test(text) || CLAUSE.test(text)
+}
+// The person's own Enter (terminal, Remote Control, or an SDK host such as an IDE); never a notification, peer or schedule.
+const PERSON = new Set(['composer', 'bridge', 'sdk'])
 const norm = (text: string) => text.replace(/\s+/g, ' ').trim()
 const KEY_CHARS = 200
 const CLEAR_MS = 60_000
@@ -33,17 +37,28 @@ const ANSWER_CHARS = 240
 const QUESTION_CHARS = 60
 
 const pins = atom({ plugin: 'pinned-answers', key: 'pins' } as const, [], { shape: 'pins-1' })
-const question = atom({ plugin: 'pinned-answers', key: 'question' } as const, '')
-const asked = atom({ plugin: 'pinned-answers', key: 'asked' } as const, '')
-const answered = atom({ plugin: 'pinned-answers', key: 'answered' } as const, '')
+// The questions this turn has read, in order; each takes the next Answer written after it.
+const armed = atom({ plugin: 'pinned-answers', key: 'armed' } as const, '')
 // Questions typed over a running turn, each until the model reads it: its queued_command row, or a later turn opening with it.
 const waiting = atom({ plugin: 'pinned-answers', key: 'waiting' } as const, '')
 
-type Waiting = { q: string; id: string; keys: string[] }
+type Waiting = { q: string; id: string; keys: string[]; turn: string }
+type Armed = { q: string; id: string; done?: true }
 
 let timer: Timer | undefined
-// Answers pinned this turn: a reply repeating one is not the answer to a question read after it.
-const said = new Set<string>()
+// Each Answer pinned this turn, by the question it went to: the final message repeating one is not the next question's.
+const said = new Map<string, string>()
+// Answers dismissed during this turn: one the turn repeats under a question read later is not its answer.
+const gone = new Set<string>()
+// The last few rows and turn prompts read: a hook's rewrite can land after the text it rewrote was carried.
+const carried: string[] = []
+// Pins in the order their blocks arrived, so the turn's end reads them settled.
+let chain: Promise<unknown> = Promise.resolve()
+const serial = <T,>(f: () => Promise<T>): Promise<T> => {
+  const run = chain.then(f, f)
+  chain = run.catch(() => undefined)
+  return run
+}
 
 // Cut at the last sentence end that fits, else the last word; the pane is for the answer, not the report.
 function clip(text: string): string {
@@ -136,47 +151,56 @@ async function show($: EngineInterface) {
   await $.ui.open({ id: PANE, title: TITLE, columns, rows: Math.min(rows, MAX_ROWS), closeOnEscape: true })
 }
 
-async function disarm($: EngineInterface) {
-  await update($, question, () => '')
-  await update($, asked, () => '')
-}
-
-async function waitList($: EngineInterface): Promise<Waiting[]> {
+function parse<T>(v: string): T[] {
   try {
-    const v: unknown = JSON.parse((await read($, waiting)) || '[]')
-    return Array.isArray(v) ? (v as Waiting[]) : []
+    const x: unknown = JSON.parse(v || '[]')
+    return Array.isArray(x) ? (x as T[]) : []
   } catch {
     return []
   }
 }
+
+const armedList = async ($: EngineInterface) => parse<Armed>(await read($, armed))
+
+async function setArmed($: EngineInterface, fn: (l: Armed[]) => Armed[]) {
+  const next = fn(await armedList($)).slice(-5)
+  await update($, armed, () => (next.length ? JSON.stringify(next) : ''))
+}
+
+const disarm = ($: EngineInterface) => setArmed($, () => [])
+
+const waitList = async ($: EngineInterface) => parse<Waiting>(await read($, waiting))
 
 async function setWaiting($: EngineInterface, fn: (l: Waiting[]) => Waiting[]) {
   const next = fn(await waitList($)).slice(-5)
   await update($, waiting, () => (next.length ? JSON.stringify(next) : ''))
 }
 
-// Arms a question the model has read; one still unanswered beside it shares the header, since the next Answer may be for either.
-async function arm1($: EngineInterface, w: Waiting) {
-  const q = await read($, question)
-  const open = q !== '' && (await read($, answered)) !== (await read($, asked))
-  await update($, question, () => (open ? `${q} · ${w.q}`.slice(0, 240) : w.q))
-  await update($, asked, () => w.id)
-}
-
-// Delivers every waiting question whose text the row or turn prompt carries.
-async function deliver($: EngineInterface, carried: string) {
-  const text = norm(carried)
+// Delivers every waiting question whose text the row or turn prompt carries; a shorter one inside a longer one's text is that one.
+async function deliver($: EngineInterface, raw: string, remember = true) {
+  const text = norm(raw)
   if (!text) return
-  const list = await waitList($)
-  const hit = list.filter(w => w.keys.some(k => text.includes(k.slice(0, KEY_CHARS))))
-  if (hit.length === 0) return
-  await setWaiting($, l => l.filter(w => !hit.some(h => h.id === w.id)))
-  for (const w of hit) await arm1($, w)
+  if (remember) carried.splice(0, carried.length, ...[...carried, text].slice(-3))
+  const key = (w: Waiting) => w.keys.map(k => k.slice(0, KEY_CHARS)).find(k => text.includes(k))
+  const hit = (await waitList($)).filter(w => key(w) !== undefined)
+  const own = hit.filter(w => {
+    const k = key(w) ?? ''
+    let rest = text
+    for (const o of hit) {
+      const ok = key(o) ?? ''
+      if (o !== w && ok.length > k.length && ok.includes(k)) rest = rest.split(ok).join(' ')
+    }
+    return rest.includes(k)
+  })
+  if (own.length === 0) return
+  await setWaiting($, l => l.filter(w => !own.some(h => h.id === w.id)))
+  await setArmed($, l => [...l.filter(x => !own.some(h => h.id === x.id)), ...own.map(w => ({ q: w.q, id: w.id }))])
 }
 
 // Drops every pin and leaves any armed question armed: 0 can be pressed mid-turn, after the next question was asked.
 async function dismiss($: EngineInterface) {
   timer?.cancel()
+  for (const p of await read($, pins)) gone.add(p.answer)
   await update($, pins, () => [])
   await $.ui.close({ id: PANE })
 }
@@ -202,19 +226,21 @@ async function prune($: EngineInterface) {
   await arm($)
 }
 
-// Pins the armed question's Answer; a later Answer for it replaces the pin, but never one the person dismissed.
-async function pin($: EngineInterface, reply: string): Promise<boolean> {
-  const q = await read($, question)
-  if (!q) return false
+// The first armed question still waiting takes the Answer, else a later one revises the newest pin; the final message only fills a wait.
+async function pin($: EngineInterface, reply: string, final = false): Promise<boolean> {
+  const list = await armedList($)
   const answer = extract(reply)
-  if (!answer) return false
-  const id = (await read($, asked)) || String(await $.clock.now())
-  if ((await read($, answered)) === id && !(await read($, pins)).some(p => p.id === id)) return false
-  if (said.has(answer) && (await read($, answered)) !== id) return false
-  const p: Pin = { id, at: await $.clock.now(), question: q, answer }
-  await update($, pins, list => [p, ...list.filter(x => x.id !== id)].slice(0, 20))
-  await update($, answered, () => id)
-  said.add(answer)
+  if (list.length === 0 || !answer) return false
+  const open = list.find(x => !x.done)
+  const t = open ?? list[list.length - 1]
+  if (!t || (final && !open)) return false
+  if (t.done && !(await read($, pins)).some(p => p.id === t.id)) return false
+  if (!t.done && gone.has(answer)) return false
+  if (final && (said.get(answer) ?? t.id) !== t.id) return false
+  const p: Pin = { id: t.id, at: await $.clock.now(), question: t.q, answer }
+  await update($, pins, l => [p, ...l.filter(x => x.id !== t.id)].slice(0, 20))
+  await setArmed($, l => l.map(x => (x.id === t.id ? { ...x, done: true } : x)))
+  said.set(answer, t.id)
   return true
 }
 
@@ -246,8 +272,9 @@ export const register: Register = on => {
         await arm($)
       }
       const own = unpasted(e.text)
-      if (!isQuestion(norm(prose(own)))) return undefined
-      const w: Waiting = { q: norm(own).slice(0, 120), id: `${now}-${Math.random().toString(36).slice(2, 8)}`, keys: [norm(e.text)] }
+      if (!isQuestion(prose(own))) return undefined
+      const id = `${now}-${Math.random().toString(36).slice(2, 8)}`
+      const w: Waiting = { q: norm(own).slice(0, 120), id, keys: [norm(e.text)], turn: e.turnId ?? '' }
       // Typed over a running turn: listed before `next`, since the turn can end and the next one open with it before `next` returns.
       if (e.turnId !== undefined) await setWaiting($, l => [...l, w])
       else await setWaiting($, l => l.filter(x => !x.keys.includes(w.keys[0] ?? '')))
@@ -259,16 +286,16 @@ export const register: Register = on => {
       if (e.turnId !== undefined) {
         // A prompt a hook dropped never reaches the model; one a hook rewrote reaches it as rewritten.
         if (asking && entered === undefined) await setWaiting($, l => l.filter(x => x.id !== asking.id))
-        else if (asking && entered !== undefined)
-          await setWaiting($, l => l.map(x => (x.id === asking.id && !x.keys.includes(entered) ? { ...x, keys: [...x.keys, entered] } : x)))
+        else if (asking && entered !== undefined && !asking.keys.includes(entered)) {
+          await setWaiting($, l => l.map(x => (x.id === asking.id ? { ...x, keys: [...x.keys, entered] } : x)))
+          for (const c of [...carried]) await deliver($, c, false)
+        }
         // A note typed over a running turn leaves that turn's question armed.
         return
       }
       if (entered === undefined) return
-      if (asking) {
-        await update($, question, () => asking.q)
-        await update($, asked, () => asking.id)
-      } else await disarm($)
+      if (asking) await setArmed($, () => [{ q: asking.q, id: asking.id }])
+      else await disarm($)
     })().catch(() => undefined)
     return r
   })
@@ -286,6 +313,7 @@ export const register: Register = on => {
   // One the turn never read runs next as a turn of its own, opening with its text.
   on('turn.start', async ($, e, next) => {
     const started = await next(e)
+    if (e.agentId === undefined) gone.clear()
     if (e.agentId === undefined) await deliver($, e.text).catch(() => undefined)
     return started
   })
@@ -295,7 +323,7 @@ export const register: Register = on => {
     const kept = await next(e)
     if (e.agentId === undefined && e.message.type === 'assistant') {
       const text = e.message.content.flatMap(b => (b.type === 'text' ? [b.text] : [])).join('\n')
-      if (MARK.test(text)) void pin($, text).then(added => (added ? show($) : undefined)).catch(() => undefined)
+      if (MARK.test(text)) void serial(() => pin($, text)).then(added => (added ? show($) : undefined)).catch(() => undefined)
     }
     return kept
   })
@@ -303,15 +331,17 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
-    await (async () => {
-      const id = await read($, asked)
-      const added = !e.isAborted && id !== '' && (await read($, answered)) !== id ? await pin($, e.answer) : false
-      // A question the turn read is done when it ends, answered or not, interrupted or not; one it never read is still waiting.
+    await serial(async () => {
+      const added = !e.isAborted && (await pin($, e.answer, true))
+      // A question the turn read is done when it ends, answered or not, interrupted or not.
       await disarm($)
       said.clear()
+      gone.clear()
+      // One typed over this turn and never read by it waits for the next turn; an older one the next turn did not open with is stale.
+      await setWaiting($, l => l.filter(w => w.turn === e.turnId))
       if ((await read($, pins)).length === 0) await $.ui.close({ id: PANE })
       else if (added) await show($)
-    })().catch(() => undefined)
+    }).catch(() => undefined)
     return done
   })
 
