@@ -6,7 +6,6 @@ declare module 'claude-code' {
       pins: Shaped<Pin[]>
       question: string
       asked: string
-      askedIn: string
       answered: string
       waiting: string
     }
